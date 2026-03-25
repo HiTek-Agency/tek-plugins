@@ -1,0 +1,31 @@
+{
+	"id": "mac-control",
+	"name": "Mac Control",
+	"version": "0.1.0",
+	"description": "Control your Mac with AI — screenshots, UI element interaction, typing, window management via Peekaboo",
+	"entryPoint": "dist/index.js",
+	"permissions": ["tools", "config", "context"],
+	"configSchema": [
+		{
+			"key": "screenshotMaxWidth",
+			"label": "Max Screenshot Width",
+			"type": "number",
+			"default": 1920,
+			"description": "Maximum pixel width for screenshots returned to agents (larger images are downscaled)"
+		}
+	],
+	"providesTools": [
+		"mac__see",
+		"mac__click",
+		"mac__type",
+		"mac__hotkey",
+		"mac__screenshot",
+		"mac__open_app",
+		"mac__window",
+		"mac__system_info"
+	],
+	"source": {
+		"type": "npm",
+		"package": "@steipete/peekaboo"
+	}
+}

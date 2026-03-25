@@ -26,8 +26,9 @@
       "author": "Tek",
       "version": "0.1.0",
       "source": {
-        "type": "npm",
-        "package": "@steipete/peekaboo"
+        "type": "git",
+        "repo": "https://github.com/HiTek-Agency/tek-plugins",
+        "path": "plugins/mac-control"
       },
       "permissions": ["tools", "config", "context"],
       "platforms": ["darwin"],
