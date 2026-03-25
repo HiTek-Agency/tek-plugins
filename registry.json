@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "updatedAt": "2026-03-25T00:00:00Z",
+  "plugins": [
+    {
+      "id": "url-summarize",
+      "name": "URL Summarizer",
+      "description": "Summarize web pages, articles, YouTube videos, and other URLs using AI — powered by the summarize CLI",
+      "author": "Tek",
+      "version": "0.1.0",
+      "source": {
+        "type": "npm",
+        "package": "@steipete/summarize"
+      },
+      "permissions": ["tools", "config", "vault-read", "context"],
+      "category": "productivity",
+      "icon": "🔗",
+      "featured": true,
+      "homepage": "https://github.com/steipete/summarize",
+      "builtin": true
+    },
+    {
+      "id": "mac-control",
+      "name": "Mac Control",
+      "description": "Control your Mac with AI — screenshots, UI element interaction, typing, window management via Peekaboo",
+      "author": "Tek",
+      "version": "0.1.0",
+      "source": {
+        "type": "npm",
+        "package": "@steipete/peekaboo"
+      },
+      "permissions": ["tools", "config", "context"],
+      "platforms": ["darwin"],
+      "category": "automation",
+      "icon": "🖥️",
+      "featured": true,
+      "homepage": "https://github.com/steipete/peekaboo",
+      "builtin": true
+    },
+    {
+      "id": "voice-stt",
+      "name": "Voice Input (STT)",
+      "description": "Speech-to-text transcription with local Whisper and online providers",
+      "author": "Tek",
+      "version": "0.1.0",
+      "source": { "type": "git" },
+      "permissions": ["ws-handlers", "config", "context", "network"],
+      "category": "voice",
+      "icon": "🎙️",
+      "builtin": true
+    },
+    {
+      "id": "voice-tts",
+      "name": "Voice Output (TTS)",
+      "description": "Text-to-speech synthesis with macOS, OpenAI, and ElevenLabs providers",
+      "author": "Tek",
+      "version": "0.1.0",
+      "source": { "type": "git" },
+      "permissions": ["ws-handlers", "config", "context", "network", "audio-output"],
+      "category": "voice",
+      "icon": "🔊",
+      "builtin": true
+    },
+    {
+      "id": "voice-conversation",
+      "name": "Voice Conversation",
+      "description": "Real-time voice conversation with AI using WebRTC and OpenAI Realtime API",
+      "author": "Tek",
+      "version": "0.2.0",
+      "source": { "type": "git" },
+      "permissions": ["ws-handlers", "config", "context", "network"],
+      "category": "voice",
+      "icon": "🗣️",
+      "builtin": true
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "id": "my-plugin",
+  "name": "My Plugin",
+  "version": "0.1.0",
+  "description": "A template Tek plugin — replace with your description",
+  "entryPoint": "dist/index.js",
+  "permissions": ["tools", "config"],
+  "configSchema": [
+    {
+      "key": "exampleSetting",
+      "label": "Example Setting",
+      "type": "string",
+      "default": "hello",
+      "description": "An example configuration field"
+    }
+  ],
+  "providesTools": ["my_plugin__example"],
+  "source": {
+    "type": "git",
+    "repo": "https://github.com/you/my-plugin"
+  }
+}
