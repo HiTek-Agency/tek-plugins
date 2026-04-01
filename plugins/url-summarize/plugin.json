@@ -1,0 +1,43 @@
+{
+	"id": "url-summarize",
+	"name": "URL Summarizer",
+	"version": "0.1.0",
+	"description": "Summarize web pages, articles, YouTube videos, and other URLs using AI — powered by the summarize CLI",
+	"entryPoint": "dist/index.js",
+	"permissions": ["tools", "config", "vault-read", "context"],
+	"configSchema": [
+		{
+			"key": "provider",
+			"label": "AI Provider",
+			"type": "select",
+			"options": [
+				{ "label": "Google (Gemini)", "value": "google" },
+				{ "label": "OpenAI", "value": "openai" },
+				{ "label": "Anthropic", "value": "anthropic" }
+			],
+			"default": "google",
+			"description": "Which AI provider to use for summarization. Uses your existing API key from the vault."
+		},
+		{
+			"key": "model",
+			"label": "Model Override",
+			"type": "string",
+			"default": "",
+			"description": "Specific model to use (e.g. gemini-2.5-flash, gpt-4o-mini). Leave blank for provider default."
+		},
+		{
+			"key": "defaultLength",
+			"label": "Default Summary Length",
+			"type": "select",
+			"options": ["short", "medium", "long"],
+			"default": "medium",
+			"description": "Default length for summaries (short ~900 chars, medium ~1800, long ~4200)"
+		}
+	],
+	"providesTools": ["summarize_url"],
+	"source": {
+		"type": "git",
+		"repo": "https://github.com/HiTek-Agency/tek-plugins",
+		"path": "plugins/url-summarize"
+	}
+}

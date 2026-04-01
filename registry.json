@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-03-25T00:00:00Z",
+  "updatedAt": "2026-04-01T00:00:00Z",
   "plugins": [
     {
       "id": "url-summarize",
@@ -9,15 +9,15 @@
       "author": "Tek",
       "version": "0.1.0",
       "source": {
-        "type": "npm",
-        "package": "@steipete/summarize"
+        "type": "git",
+        "repo": "https://github.com/HiTek-Agency/tek-plugins",
+        "path": "plugins/url-summarize"
       },
       "permissions": ["tools", "config", "vault-read", "context"],
       "category": "productivity",
       "icon": "🔗",
       "featured": true,
-      "homepage": "https://github.com/steipete/summarize",
-      "builtin": true
+      "homepage": "https://github.com/steipete/summarize"
     },
     {
       "id": "mac-control",
@@ -35,8 +35,7 @@
       "category": "automation",
       "icon": "🖥️",
       "featured": true,
-      "homepage": "https://github.com/steipete/peekaboo",
-      "builtin": true
+      "homepage": "https://github.com/steipete/peekaboo"
     },
     {
       "id": "voice-stt",
@@ -44,7 +43,9 @@
       "description": "Speech-to-text transcription with local Whisper and online providers",
       "author": "Tek",
       "version": "0.1.0",
-      "source": { "type": "git" },
+      "source": {
+        "type": "builtin"
+      },
       "permissions": ["ws-handlers", "config", "context", "network"],
       "category": "voice",
       "icon": "🎙️",
@@ -56,7 +57,9 @@
       "description": "Text-to-speech synthesis with macOS, OpenAI, and ElevenLabs providers",
       "author": "Tek",
       "version": "0.1.0",
-      "source": { "type": "git" },
+      "source": {
+        "type": "builtin"
+      },
       "permissions": ["ws-handlers", "config", "context", "network", "audio-output"],
       "category": "voice",
       "icon": "🔊",
@@ -68,7 +71,9 @@
       "description": "Real-time voice conversation with AI using WebRTC and OpenAI Realtime API",
       "author": "Tek",
       "version": "0.2.0",
-      "source": { "type": "git" },
+      "source": {
+        "type": "builtin"
+      },
       "permissions": ["ws-handlers", "config", "context", "network"],
       "category": "voice",
       "icon": "🗣️",
