@@ -3,21 +3,17 @@
  *
  * Responsibilities:
  *   - Keep an offscreen document alive that hosts the persistent WebSocket
- *     connection to the Tek gateway (service workers are killed aggressively,
- *     so we delegate the long-lived socket to an offscreen doc).
- *   - Use chrome.alarms as a keepalive ping so that if the SW is woken up, we
- *     re-ensure the offscreen doc exists.
- *   - Receive RPC dispatch requests from the offscreen doc (kind: "call") and,
- *     in future plans, execute them against chrome.debugger / chrome.tabs /
- *     chrome.scripting. For plan 02 this is a stub that returns "not implemented".
- *
- * Full dispatch table lands in plans 04/05.
+ *     connection to the Tek gateway (SWs are killed aggressively, so the
+ *     long-lived socket lives in the offscreen doc).
+ *   - chrome.alarms keepalive ping — if SW wakes, re-ensure offscreen doc.
+ *   - Dispatch RPC requests from the offscreen doc (kind: "call") — plans
+ *     04/05 will fill the per-tool cases. Plan 03 keeps the routing scaffold
+ *     so tool branches slot in cleanly.
  */
 
 const OFFSCREEN_URL = "offscreen.html";
 
 async function hasOffscreenDoc() {
-	// chrome.offscreen.hasDocument is a newer API — fall back to matching contexts.
 	if (typeof chrome.offscreen?.hasDocument === "function") {
 		try {
 			return await chrome.offscreen.hasDocument();
@@ -70,16 +66,45 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 	}
 });
 
-// RPC dispatch — offscreen asks background to run a Chrome API call. Plan 02 is stub.
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+/**
+ * Tool dispatch — offscreen asks background to run a Chrome API call.
+ * Plan 03: routing scaffold + per-tool stubs. Plans 04/05 replace each case body.
+ */
+async function dispatchTool(tool, _args) {
+	switch (tool) {
+		case "tabs_list":
+		case "tabs_create":
+		case "navigate":
+		case "read_page":
+		case "find":
+		case "click":
+		case "form_input":
+		case "screenshot":
+		case "javascript_tool":
+			return { error: `tool not implemented (plan 04/05): ${tool}` };
+		default:
+			return { error: `unknown tool: ${tool}` };
+	}
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
 	if (msg.kind !== "call") return;
-	// Dispatch table is empty in plan 02 — respond with not-implemented.
-	sendResponse({
-		id: msg.id,
-		kind: "result",
-		error: "not implemented (plan 04/05)",
-	});
+	// Return a { id, kind: "result", error | result } envelope matching gateway protocol.
+	dispatchTool(msg.tool, msg.args)
+		.then((outcome) => {
+			const envelope = { id: msg.id, kind: "result" };
+			if ("error" in outcome) envelope.error = outcome.error;
+			else envelope.result = outcome.result;
+			sendResponse(envelope);
+		})
+		.catch((err) => {
+			sendResponse({
+				id: msg.id,
+				kind: "result",
+				error: String(err?.message || err),
+			});
+		});
 	return true;
 });
 

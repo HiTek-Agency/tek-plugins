@@ -2,19 +2,12 @@
  * Tek Chrome Control — offscreen document.
  *
  * Hosts the persistent WebSocket connection to the Tek gateway on
- * ws://127.0.0.1:<port>/?token=<token>. The token MUST be passed via the URL
- * query string — the browser WebSocket constructor does NOT accept custom
- * request metadata beyond the URL and sub-protocols; options objects are a
- * Node-ws extension only and are not available in MV3 service workers /
- * offscreen docs.
+ * ws://127.0.0.1:<port>/?token=<token>. Token MUST be passed via URL query —
+ * the browser WebSocket constructor does NOT accept custom request metadata
+ * beyond the URL and sub-protocols; options objects are a Node-ws extension.
  *
- * Plan 02 responsibilities:
- *   - Read token + port from chrome.storage.local
- *   - If token present: attempt connect; on close, exponential-backoff reconnect
- *   - If missing: broadcast status { connected: false, reason: "no-token" }
- *   - Accept { kind: "set-token" } / { kind: "reset" } / { kind: "status" } from popup
- *
- * Plan 03 replaces this stub with a full handshake + ping/pong + resume logic.
+ * Plan 03 — full handshake + exponential backoff + ping + popup token paste.
+ * Plans 04/05 fill the "call" dispatch via chrome.runtime.sendMessage to SW.
  */
 
 const DEFAULT_PORT = 52871;
@@ -23,45 +16,75 @@ const MAX_BACKOFF_MS = 30_000;
 
 /** @type {WebSocket | null} */
 let ws = null;
-let backoff = MIN_BACKOFF_MS;
+/** connecting | connected | disconnected */
+let state = "disconnected";
+let reason = "starting";
+let gatewayVersion = null;
+let serverTime = null;
+let attempt = 0;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let reconnectTimer = null;
-let status = { connected: false, reason: "starting" };
 
-async function loadAuth() {
-	const { auth, wsPort } = await chrome.storage.local.get(["auth", "wsPort"]);
+function currentStatus() {
 	return {
-		token: typeof auth === "string" ? auth : auth?.token ?? null,
-		port: typeof wsPort === "number" && wsPort > 0 ? wsPort : DEFAULT_PORT,
+		connected: state === "connected",
+		state,
+		reason,
+		gatewayVersion,
+		serverTime,
 	};
 }
 
-function broadcastStatus(next) {
-	status = { ...status, ...next };
+function broadcastStatus() {
 	try {
-		chrome.runtime.sendMessage({ kind: "status", ...status }).catch(() => {});
+		chrome.runtime
+			.sendMessage({ kind: "status", ...currentStatus() })
+			.catch(() => {});
 	} catch {
 		// popup may not be open — ignore
 	}
 }
 
+function setState(nextState, nextReason) {
+	state = nextState;
+	if (nextReason) reason = nextReason;
+	broadcastStatus();
+}
+
+async function loadAuth() {
+	const { auth, wsPort } = await chrome.storage.local.get(["auth", "wsPort"]);
+	// CONTEXT D-12: token is stored under auth.token. Back-compat: accept plain string too.
+	const token =
+		typeof auth === "string" ? auth : auth && typeof auth === "object" ? auth.token ?? null : null;
+	const port =
+		typeof wsPort === "number" && wsPort > 0 ? wsPort : DEFAULT_PORT;
+	return { token, port };
+}
+
 function scheduleReconnect() {
 	if (reconnectTimer) clearTimeout(reconnectTimer);
+	// Exponential backoff: 1s, 2s, 4s, 8s, 16s, capped at 30s
+	const delay = Math.min(MAX_BACKOFF_MS, MIN_BACKOFF_MS * Math.pow(2, attempt));
+	attempt++;
 	reconnectTimer = setTimeout(() => {
 		reconnectTimer = null;
 		connect();
-	}, backoff);
-	backoff = Math.min(backoff * 2, MAX_BACKOFF_MS);
+	}, delay);
+}
+
+function getChromeVersion() {
+	const m = navigator.userAgent.match(/Chrome\/([\d.]+)/);
+	return m?.[1] ?? "unknown";
 }
 
 async function connect() {
 	const { token, port } = await loadAuth();
 	if (!token) {
-		broadcastStatus({ connected: false, reason: "no-token" });
+		setState("disconnected", "no-token");
 		return;
 	}
 
-	// Clean up any prior socket.
+	// Clean up any prior socket
 	if (ws) {
 		try {
 			ws.close();
@@ -72,26 +95,72 @@ async function connect() {
 	}
 
 	const url = `ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`;
-	broadcastStatus({ connected: false, reason: "connecting" });
+	setState("connecting", "connecting");
 
 	try {
 		ws = new WebSocket(url);
 	} catch (err) {
 		console.warn("[tek] WS construct failed", err);
-		broadcastStatus({ connected: false, reason: "connect-error" });
+		setState("disconnected", "connect-error");
 		scheduleReconnect();
 		return;
 	}
 
 	ws.onopen = () => {
 		console.log("[tek] WS open", url);
-		backoff = MIN_BACKOFF_MS;
-		broadcastStatus({ connected: true, reason: "open" });
+		// Send hello handshake — gateway will reply with welcome
+		const hello = {
+			kind: "hello",
+			version: chrome.runtime.getManifest().version || "0.1.0",
+			chromeVersion: getChromeVersion(),
+			extensionId: chrome.runtime.id,
+			capabilities: ["tabs", "debugger", "scripting", "screenshot"],
+		};
+		try {
+			ws.send(JSON.stringify(hello));
+		} catch (err) {
+			console.warn("[tek] hello send failed", err);
+		}
 	};
 
-	ws.onmessage = (event) => {
-		// Plan 03+ will parse and dispatch handshake + RPC messages.
-		console.log("[tek] WS message", event.data);
+	ws.onmessage = async (event) => {
+		let msg;
+		try {
+			msg = JSON.parse(event.data);
+		} catch {
+			return;
+		}
+		if (msg.kind === "welcome") {
+			gatewayVersion = msg.gatewayVersion ?? null;
+			serverTime = msg.serverTime ?? null;
+			attempt = 0; // reset backoff on successful handshake
+			setState("connected", "open");
+			return;
+		}
+		if (msg.kind === "call") {
+			// Forward RPC call to SW for dispatch (plan 04/05 fill bodies)
+			try {
+				const result = await chrome.runtime.sendMessage({
+					kind: "call",
+					id: msg.id,
+					tool: msg.tool,
+					args: msg.args,
+				});
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					ws.send(JSON.stringify(result ?? { id: msg.id, kind: "result", error: "no-sw-response" }));
+				}
+			} catch (err) {
+				if (ws && ws.readyState === WebSocket.OPEN) {
+					ws.send(
+						JSON.stringify({
+							id: msg.id,
+							kind: "result",
+							error: String(err?.message || err),
+						}),
+					);
+				}
+			}
+		}
 	};
 
 	ws.onerror = (event) => {
@@ -101,14 +170,17 @@ async function connect() {
 	ws.onclose = (event) => {
 		console.log("[tek] WS close", event.code, event.reason);
 		ws = null;
-		broadcastStatus({ connected: false, reason: "closed" });
+		// 4401 = unauthorized (bad/missing token). Still reconnect — user may paste a new token.
+		const closeReason = event.code === 4401 ? "unauthorized" : "closed";
+		setState("disconnected", closeReason);
 		scheduleReconnect();
 	};
 }
 
-async function setToken(token) {
-	await chrome.storage.local.set({ auth: token });
-	backoff = MIN_BACKOFF_MS;
+async function setToken(tokenValue) {
+	// CONTEXT D-12: persist as auth.token object shape
+	await chrome.storage.local.set({ auth: { token: tokenValue } });
+	attempt = 0; // reset backoff — user just fixed auth
 	if (reconnectTimer) {
 		clearTimeout(reconnectTimer);
 		reconnectTimer = null;
@@ -117,7 +189,11 @@ async function setToken(token) {
 }
 
 async function reset() {
-	await chrome.storage.local.remove(["auth"]);
+	attempt = 0;
+	if (reconnectTimer) {
+		clearTimeout(reconnectTimer);
+		reconnectTimer = null;
+	}
 	if (ws) {
 		try {
 			ws.close();
@@ -126,7 +202,8 @@ async function reset() {
 		}
 		ws = null;
 	}
-	broadcastStatus({ connected: false, reason: "no-token" });
+	// Immediately reconnect — will short-circuit to no-token if none saved.
+	connect();
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -140,7 +217,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		return true;
 	}
 	if (msg.kind === "status") {
-		sendResponse({ kind: "status", ...status });
+		sendResponse({ kind: "status", ...currentStatus() });
 		return true;
 	}
 	return undefined;
