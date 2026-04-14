@@ -1,0 +1,9 @@
+{
+	"name": "@tek-plugins/chrome",
+	"version": "0.1.0",
+	"type": "module",
+	"main": "dist/index.js",
+	"dependencies": {
+		"ws": "^8.18.0"
+	}
+}

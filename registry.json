@@ -20,6 +20,23 @@
       "homepage": "https://github.com/steipete/summarize"
     },
     {
+      "id": "chrome",
+      "name": "Chrome Control",
+      "description": "Drive your real Chrome browser with AI — screenshots, navigation, clicks, typing, JS eval",
+      "author": "Tek",
+      "version": "0.1.0",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/HiTek-Agency/tek-plugins",
+        "path": "plugins/chrome"
+      },
+      "permissions": ["tools", "config", "context", "ws-handlers"],
+      "platforms": ["darwin", "win32", "linux"],
+      "category": "automation",
+      "icon": "🌐",
+      "featured": false
+    },
+    {
       "id": "mac-control",
       "name": "Mac Control",
       "description": "Control your Mac with AI — screenshots, UI element interaction, typing, window management via Peekaboo",

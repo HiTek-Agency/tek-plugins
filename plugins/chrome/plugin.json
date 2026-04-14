@@ -1,0 +1,39 @@
+{
+	"id": "chrome",
+	"name": "Chrome Control",
+	"version": "0.1.0",
+	"description": "Drive your real Chrome browser with AI — tabs, navigation, screenshots, AX-tree reads, clicks, typing, and JS evaluation via a local extension over a loopback WebSocket",
+	"entryPoint": "dist/index.js",
+	"permissions": ["tools", "config", "context", "ws-handlers"],
+	"configSchema": [
+		{
+			"key": "wsPort",
+			"label": "Loopback WebSocket Port",
+			"type": "number",
+			"default": 52871,
+			"description": "Port the gateway listens on (127.0.0.1 only). The extension must use this port."
+		},
+		{
+			"key": "screenshotMaxWidth",
+			"label": "Max Screenshot Width",
+			"type": "number",
+			"default": 1920,
+			"description": "Screenshots wider than this are downscaled before being sent to the agent."
+		}
+	],
+	"providesTools": [
+		"chrome__tabs_list",
+		"chrome__tabs_create",
+		"chrome__navigate",
+		"chrome__read_page",
+		"chrome__find",
+		"chrome__click",
+		"chrome__form_input",
+		"chrome__screenshot",
+		"chrome__javascript_tool"
+	],
+	"source": {
+		"type": "git",
+		"repo": "https://github.com/HiTek-Agency/tek-plugins"
+	}
+}
