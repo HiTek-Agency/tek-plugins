@@ -81,7 +81,13 @@ async function ensureAttached(tabId) {
 	await chrome.debugger.sendCommand(target, "DOM.enable");
 	await chrome.debugger.sendCommand(target, "Runtime.enable");
 	await chrome.debugger.sendCommand(target, "Accessibility.enable");
-	attached.set(tabId, { domains: ["Page", "DOM", "Runtime", "Accessibility"] });
+	// Input domain is required for dispatchMouseEvent / insertText / dispatchKeyEvent
+	try {
+		await chrome.debugger.sendCommand(target, "Input.enable");
+	} catch {
+		// Input.enable may not exist in all protocol versions; commands still work.
+	}
+	attached.set(tabId, { domains: ["Page", "DOM", "Runtime", "Accessibility", "Input"] });
 }
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -89,12 +95,41 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 		chrome.debugger.detach({ tabId }).catch(() => {});
 		attached.delete(tabId);
 	}
+	mainWorldContexts.delete(tabId);
 });
 
 if (chrome.debugger?.onDetach) {
 	chrome.debugger.onDetach.addListener((source, reason) => {
 		console.log("[tek] debugger detached:", source, reason);
-		if (source.tabId) attached.delete(source.tabId);
+		if (source.tabId) {
+			attached.delete(source.tabId);
+			mainWorldContexts.delete(source.tabId);
+		}
+	});
+}
+
+/* ---------------- main-world execution context tracking ----------------
+ * Runtime.evaluate without a contextId targets an arbitrary default — for
+ * reliable main-world access we capture the contextId of the top-frame
+ * default (isolated=false, auxData.isDefault=true) via executionContextCreated
+ * events. Falls back to omitting contextId when we haven't seen one yet.
+ */
+const mainWorldContexts = new Map(); // tabId -> contextId (number)
+
+if (chrome.debugger?.onEvent) {
+	chrome.debugger.onEvent.addListener((source, method, params) => {
+		if (!source?.tabId) return;
+		if (method === "Runtime.executionContextCreated") {
+			if (params?.context?.auxData?.isDefault === true) {
+				mainWorldContexts.set(source.tabId, params.context.id);
+			}
+		} else if (method === "Runtime.executionContextDestroyed") {
+			if (mainWorldContexts.get(source.tabId) === params?.executionContextId) {
+				mainWorldContexts.delete(source.tabId);
+			}
+		} else if (method === "Runtime.executionContextsCleared") {
+			mainWorldContexts.delete(source.tabId);
+		}
 	});
 }
 
@@ -177,7 +212,216 @@ const TOOL_HANDLERS = {
 			totalNodes: pruned.totalNodes,
 		};
 	},
-	// find / click / form_input / screenshot / javascript_tool — plan 05
+	find: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		const target = { tabId };
+		if (typeof args.selector === "string" && args.selector.length > 0) {
+			const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+				expression: `(() => {
+					const els = document.querySelectorAll(${JSON.stringify(args.selector)});
+					return Array.from(els).slice(0, 50).map((el) => {
+						const r = el.getBoundingClientRect();
+						return {
+							axNodeId: null,
+							role: el.getAttribute("role") || el.tagName.toLowerCase(),
+							name: (el.innerText || el.value || el.getAttribute("aria-label") || "").slice(0, 100),
+							boundingBox: { x: r.x, y: r.y, w: r.width, h: r.height },
+						};
+					});
+				})()`,
+				returnByValue: true,
+			});
+			return { matches: result?.value ?? [] };
+		}
+		// Query mode: walk AX tree for name substring + optional role filter
+		const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+		const q = String(args.query || "").toLowerCase();
+		const roleFilter = args.role;
+		const matches = (ax?.nodes || [])
+			.filter((n) => {
+				const nameValue = (n.name?.value || "").toLowerCase();
+				if (roleFilter && n.role?.value !== roleFilter) return false;
+				return q ? nameValue.includes(q) : Boolean(nameValue);
+			})
+			.slice(0, 50)
+			.map((n) => ({
+				axNodeId: n.nodeId,
+				backendDOMNodeId: n.backendDOMNodeId,
+				role: n.role?.value,
+				name: n.name?.value,
+				boundingBox: null,
+			}));
+		return { matches };
+	},
+
+	click: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		const target = { tabId };
+		let box;
+		if (args.axNodeId != null) {
+			try {
+				const { object } = await chrome.debugger.sendCommand(target, "DOM.resolveNode", {
+					backendNodeId: args.axNodeId,
+				});
+				const { model } = await chrome.debugger.sendCommand(target, "DOM.getBoxModel", {
+					objectId: object.objectId,
+				});
+				const c = model.content;
+				box = { x: (c[0] + c[4]) / 2, y: (c[1] + c[5]) / 2 };
+			} catch (e) {
+				return { ok: false, reason: `axNodeId-resolve-failed: ${e?.message ?? e}` };
+			}
+		} else if (typeof args.selector === "string") {
+			const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+				expression: `(() => {
+					const el = document.querySelector(${JSON.stringify(args.selector)});
+					if (!el) return null;
+					el.scrollIntoView({ block: "center" });
+					const r = el.getBoundingClientRect();
+					return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+				})()`,
+				returnByValue: true,
+			});
+			if (!result?.value) return { ok: false, reason: "selector-not-found" };
+			box = result.value;
+		} else {
+			return { ok: false, reason: "selector-or-axNodeId-required" };
+		}
+		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+			type: "mouseMoved",
+			x: box.x,
+			y: box.y,
+		});
+		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+			type: "mousePressed",
+			x: box.x,
+			y: box.y,
+			button: "left",
+			clickCount: 1,
+		});
+		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+			type: "mouseReleased",
+			x: box.x,
+			y: box.y,
+			button: "left",
+			clickCount: 1,
+		});
+		return { ok: true, x: box.x, y: box.y };
+	},
+
+	form_input: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		const target = { tabId };
+		if (typeof args.text !== "string") return { ok: false, reason: "text-required" };
+		// Focus element first via click (uses same selector/axNodeId path)
+		const clickRes = await TOOL_HANDLERS.click({ ...args, tabId });
+		if (!clickRes.ok) return { ok: false, reason: `focus-failed: ${clickRes.reason}` };
+		if (args.clear) {
+			// Best-effort select-all + delete
+			try {
+				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+					type: "keyDown",
+					modifiers: 4, // Meta on mac, Ctrl on others — 4 maps to Ctrl
+					windowsVirtualKeyCode: 65, // 'A'
+					key: "a",
+					commands: ["selectAll"],
+				});
+				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+					type: "keyDown",
+					windowsVirtualKeyCode: 46, // Delete
+					key: "Delete",
+				});
+			} catch {
+				// clear is best-effort; continue with insert
+			}
+		}
+		await chrome.debugger.sendCommand(target, "Input.insertText", { text: args.text });
+		return { ok: true };
+	},
+
+	screenshot: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		// CDP captureScreenshot runs in SW; OffscreenCanvas isn't available here, so
+		// forward raw base64 to offscreen doc for downscaling.
+		const { data } = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
+			format: "png",
+			captureBeyondViewport: false,
+		});
+		const downscaled = await new Promise((resolve, reject) => {
+			chrome.runtime.sendMessage(
+				{ kind: "downscale", base64: data, maxWidth: args.maxWidth || 1920 },
+				(resp) => {
+					if (chrome.runtime.lastError) {
+						return reject(new Error(chrome.runtime.lastError.message));
+					}
+					if (!resp) return reject(new Error("no-downscale-response"));
+					if (resp.error) return reject(new Error(resp.error));
+					resolve(resp);
+				},
+			);
+		});
+		return {
+			base64: downscaled.base64,
+			width: downscaled.width,
+			height: downscaled.height,
+		};
+	},
+
+	javascript_tool: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		const target = { tabId };
+		if (typeof args.expression !== "string") {
+			return { error: { name: "ArgError", message: "expression required", stack: "" } };
+		}
+		const contextId = mainWorldContexts.get(tabId);
+		const params = {
+			expression: args.expression,
+			returnByValue: true,
+			awaitPromise: true,
+		};
+		if (typeof contextId === "number") params.contextId = contextId;
+		let res;
+		try {
+			res = await chrome.debugger.sendCommand(target, "Runtime.evaluate", params);
+		} catch (e) {
+			return {
+				error: {
+					name: "CDPError",
+					message: String(e?.message ?? e),
+					stack: "",
+				},
+			};
+		}
+		if (res?.exceptionDetails) {
+			const ex = res.exceptionDetails.exception || {};
+			return {
+				error: {
+					name: ex.className || "Error",
+					message: ex.description || res.exceptionDetails.text || "evaluation failed",
+					stack: res.exceptionDetails.stackTrace
+						? JSON.stringify(res.exceptionDetails.stackTrace)
+						: "",
+				},
+			};
+		}
+		const v = res?.result?.value;
+		let serialized;
+		try {
+			serialized = JSON.stringify(v);
+		} catch {
+			serialized = String(v);
+		}
+		return {
+			value: serialized,
+			type: res?.result?.type,
+			subtype: res?.result?.subtype,
+		};
+	},
 };
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -188,7 +432,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		sendResponse({
 			id: msg.id,
 			kind: "result",
-			error: `tool not implemented: ${msg.tool} (plan 05)`,
+			error: `tool not implemented: ${msg.tool}`,
 		});
 		return false;
 	}
