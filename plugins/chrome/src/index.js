@@ -23,6 +23,16 @@ import { join, dirname } from "node:path";
 
 const TOKEN_PATH = join(homedir(), ".config", "tek", "chrome-control.token");
 const META_PATH = join(homedir(), ".config", "tek", "chrome-control.json");
+const SCREENSHOT_DIR = join(
+	homedir(),
+	".config",
+	"tek",
+	"plugins",
+	"chrome",
+	"data",
+	"screenshots",
+);
+mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 function getOrCreateToken() {
 	mkdirSync(dirname(TOKEN_PATH), { recursive: true });
@@ -255,43 +265,156 @@ export async function register(ctx) {
 		execute: (args) => _rpc("read_page", args),
 	});
 
-	// Remaining 5 tools keep generic loop-based registration — plan 05 will tighten.
-	const TOOLS = [
-		"find",
-		"click",
-		"form_input",
-		"screenshot",
-		"javascript_tool",
-	];
-	for (const t of TOOLS) {
-		const opts =
-			t === "javascript_tool" ? { approvalTier: "always" } : undefined;
-		const timeout = t === "screenshot" ? 60_000 : 30_000;
-		ctx.addTool(
-			t,
-			{
-				description: `chrome ${t} (full schema in plan 05)`,
-				parameters: {
-					type: "object",
-					properties: {},
-					additionalProperties: true,
+	// Plan 05: explicit schemas for find / click / form_input / screenshot / javascript_tool.
+	ctx.addTool("find", {
+		description:
+			"Find elements on a page by CSS selector OR accessibility query (text + optional role). Returns { matches: [{ axNodeId, role, name, boundingBox }] } capped at 50. Prefer query+role for natural-language lookups; use selector for precision.",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: { type: "number", description: "Target tab. Defaults to active tab." },
+				selector: { type: "string", description: "CSS selector (mutually exclusive with query)" },
+				query: {
+					type: "string",
+					description: "Case-insensitive substring of the accessible name",
 				},
-				execute: (args) => _rpc(t, args ?? {}, timeout),
+				role: {
+					type: "string",
+					description:
+						"ARIA role filter used with query (e.g. 'button', 'link', 'textbox')",
+				},
 			},
-			opts,
-		);
-	}
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("find", args ?? {}),
+	});
+
+	ctx.addTool("click", {
+		description:
+			"Click an element. Pass either selector OR axNodeId (from chrome__find / chrome__read_page). Returns { ok, reason?, x, y }. Uses trusted CDP Input events so event.isTrusted checks pass.",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: { type: "number", description: "Target tab. Defaults to active tab." },
+				selector: { type: "string" },
+				axNodeId: {
+					type: "number",
+					description: "backendDOMNodeId returned by chrome__find or chrome__read_page",
+				},
+			},
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("click", args ?? {}),
+	});
+
+	ctx.addTool("form_input", {
+		description:
+			"Type text into an input. Focuses the element first by clicking (same selector/axNodeId semantics as chrome__click). Returns { ok, reason? }.",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: { type: "number" },
+				selector: { type: "string" },
+				axNodeId: { type: "number" },
+				text: { type: "string", description: "Text to insert" },
+				clear: {
+					type: "boolean",
+					description: "If true, select-all + delete before inserting",
+					default: false,
+				},
+			},
+			required: ["text"],
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("form_input", args ?? {}),
+	});
+
+	ctx.addTool("screenshot", {
+		description:
+			"Capture a PNG screenshot of a tab's visible viewport. The image renders inline in chat via the image.generated side-channel; the tool result contains ONLY { path, width, height } — no base64 — so it won't blow up LLM context.",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: { type: "number", description: "Target tab. Defaults to active tab." },
+				maxWidth: {
+					type: "number",
+					description:
+						"Downscale to at most this width before save (default: plugin cfg.screenshotMaxWidth or 1920)",
+				},
+			},
+			additionalProperties: false,
+		},
+		// Vercel AI SDK invokes plugin tools directly with (args, execOptions).
+		// execOptions.toolCallId is mandatory per the AI SDK contract and is what
+		// correlates the image.generated side-channel to the inline placeholder.
+		// Precedent: packages/gateway/src/tools/generate-image.ts (lines 101+169).
+		execute: async (args, execOptions) => {
+			const maxWidth = Number(args?.maxWidth) || Number(cfg.screenshotMaxWidth) || 1920;
+			const result = await _rpc("screenshot", { ...(args ?? {}), maxWidth }, 60_000);
+			const ts = Date.now();
+			const filename = `chrome-${ts}.png`;
+			const fullPath = join(SCREENSHOT_DIR, filename);
+			writeFileSync(fullPath, Buffer.from(result.base64, "base64"));
+			const toolCallId = execOptions?.toolCallId || `chrome-screenshot-${ts}`;
+			try {
+				ctx.send?.({
+					kind: "image.generated",
+					toolCallId,
+					path: fullPath,
+					thumbnailBase64: result.base64,
+					width: result.width,
+					height: result.height,
+					prompt: `Chrome screenshot (tab ${args?.tabId ?? "active"})`,
+				});
+			} catch (e) {
+				ctx.logger?.warn?.(
+					`chrome-control: failed to emit image.generated: ${e?.message ?? e}`,
+				);
+			}
+			// NEVER include base64 in the tool result (CONTEXT: image data must not enter LLM results)
+			return { path: fullPath, width: result.width, height: result.height };
+		},
+	});
+
+	ctx.addTool(
+		"javascript_tool",
+		{
+			description:
+				"Evaluate a JavaScript expression in the page's MAIN world. Returns { value, type, subtype } on success or { error: { name, message, stack } } on exception. DANGEROUS — every call requires user approval.",
+			parameters: {
+				type: "object",
+				properties: {
+					tabId: { type: "number" },
+					expression: {
+						type: "string",
+						description: "JavaScript expression to evaluate (await supported)",
+					},
+				},
+				required: ["expression"],
+				additionalProperties: false,
+			},
+			execute: (args) => _rpc("javascript_tool", args ?? {}, 30_000),
+		},
+		{ approvalTier: "always" },
+	);
 
 	// WS handler for desktop → gateway status polling. Plan 06 will poll this.
 	// Note: plugin WS handlers are namespaced as plugin.{pluginId}.{type}, so this
 	// registers as "plugin.chrome.status". Desktop (Plan 06) should send
 	// type "plugin.chrome.status" to receive { connected, lastHandshakeAt, port }.
 	// The logical name is chrome.status (W3: desktop Installed & connected badge).
-	const statusHandler = async () => ({
-		connected: _sock !== null && _lastHandshakeAt !== null,
-		lastHandshakeAt: _lastHandshakeAt,
-		port,
-	});
+	// Echoes requestId back for desktop RPC correlation (Plan 06 gateway-rpc pattern).
+	const statusHandler = async (msg) => {
+		const m = msg && typeof msg === "object" ? msg : {};
+		return {
+			type: "plugin.chrome.status.result",
+			id: m.id,
+			requestId: m.id,
+			connected: _sock !== null && _lastHandshakeAt !== null,
+			lastHandshakeAt: _lastHandshakeAt,
+			port,
+		};
+	};
 	if (typeof ctx.addWsHandler === "function") {
 		// Namespaced to plugin.chrome.status by sandbox — see comment above.
 		ctx.addWsHandler("status", statusHandler);
