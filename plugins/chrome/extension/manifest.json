@@ -1,0 +1,12 @@
+{
+	"manifest_version": 3,
+	"name": "Tek Chrome Control",
+	"version": "0.1.0",
+	"description": "Connects your Chrome to the Tek gateway so AI agents can control tabs, take screenshots, read pages, click, type, and run JS.",
+	"minimum_chrome_version": "116",
+	"permissions": ["debugger", "tabs", "scripting", "storage", "offscreen", "alarms", "activeTab"],
+	"host_permissions": ["<all_urls>"],
+	"background": { "service_worker": "background.js", "type": "module" },
+	"action": { "default_popup": "popup.html", "default_icon": "icons/48.png" },
+	"icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+}
