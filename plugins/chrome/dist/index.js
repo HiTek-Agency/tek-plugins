@@ -181,12 +181,82 @@ export async function register(ctx) {
 		`chrome-control listening on ws://127.0.0.1:${port} (token at ~/.config/tek/chrome-control.token)`,
 	);
 
-	// Register all 9 tool stubs that pipe through _rpc — schemas tightened in plans 04/05
+	// Plan 04: tight schemas for the four navigation/read tools.
+	ctx.addTool("tabs_list", {
+		description:
+			"List all open Chrome tabs across all windows. Returns array of { id, url, title, active, windowId }. Useful for finding the right tab before navigating or reading.",
+		parameters: {
+			type: "object",
+			properties: {},
+			additionalProperties: false,
+		},
+		execute: () => _rpc("tabs_list", {}),
+	});
+
+	ctx.addTool("tabs_create", {
+		description:
+			"Open a new Chrome tab. Returns { id, url, windowId }.",
+		parameters: {
+			type: "object",
+			properties: {
+				url: {
+					type: "string",
+					description:
+						"URL to open (must include scheme, e.g. https://)",
+				},
+				active: {
+					type: "boolean",
+					description:
+						"Whether the new tab should become active. Default true.",
+					default: true,
+				},
+			},
+			required: ["url"],
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("tabs_create", args),
+	});
+
+	ctx.addTool("navigate", {
+		description:
+			"Navigate a tab to a URL and wait for load to complete. Returns { tabId, url, title }.",
+		parameters: {
+			type: "object",
+			properties: {
+				url: {
+					type: "string",
+					description: "Target URL (must include scheme)",
+				},
+				tabId: {
+					type: "number",
+					description:
+						"Tab to navigate. Defaults to active tab in current window.",
+				},
+			},
+			required: ["url"],
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("navigate", args),
+	});
+
+	ctx.addTool("read_page", {
+		description:
+			"Read a tab's visible text and pruned accessibility tree. Returns { text, axTree, truncated, totalNodes }. axTree nodes have axNodeId usable with chrome__find / chrome__click. text is innerText (max 50 KB).",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: {
+					type: "number",
+					description: "Tab to read. Defaults to active tab.",
+				},
+			},
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("read_page", args),
+	});
+
+	// Remaining 5 tools keep generic loop-based registration — plan 05 will tighten.
 	const TOOLS = [
-		"tabs_list",
-		"tabs_create",
-		"navigate",
-		"read_page",
 		"find",
 		"click",
 		"form_input",
@@ -200,7 +270,7 @@ export async function register(ctx) {
 		ctx.addTool(
 			t,
 			{
-				description: `chrome ${t} (full schema in plans 04/05)`,
+				description: `chrome ${t} (full schema in plan 05)`,
 				parameters: {
 					type: "object",
 					properties: {},
