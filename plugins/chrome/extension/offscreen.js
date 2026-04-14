@@ -206,6 +206,28 @@ async function reset() {
 	connect();
 }
 
+/* ---------------- image downscaling (Plan 05 — chrome__screenshot) ----------------
+ * The SW captures PNGs via CDP Page.captureScreenshot but OffscreenCanvas is not
+ * available in service workers (as of Chrome 125 — createImageBitmap exists in SW
+ * but OffscreenCanvas.convertToBlob does not). We do the downscale here instead.
+ */
+async function downscaleBase64PNG(b64, maxWidth) {
+	const blob = await (await fetch(`data:image/png;base64,${b64}`)).blob();
+	const bitmap = await createImageBitmap(blob);
+	const ratio = bitmap.width > maxWidth ? maxWidth / bitmap.width : 1;
+	const w = Math.round(bitmap.width * ratio);
+	const h = Math.round(bitmap.height * ratio);
+	const canvas = new OffscreenCanvas(w, h);
+	const ctx = canvas.getContext("2d");
+	ctx.drawImage(bitmap, 0, 0, w, h);
+	const outBlob = await canvas.convertToBlob({ type: "image/png" });
+	const buf = await outBlob.arrayBuffer();
+	const bytes = new Uint8Array(buf);
+	let bin = "";
+	for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+	return { base64: btoa(bin), width: w, height: h };
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
 	if (msg.kind === "set-token" && typeof msg.token === "string") {
@@ -218,6 +240,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	}
 	if (msg.kind === "status") {
 		sendResponse({ kind: "status", ...currentStatus() });
+		return true;
+	}
+	if (msg.kind === "downscale" && typeof msg.base64 === "string") {
+		downscaleBase64PNG(msg.base64, Number(msg.maxWidth) || 1920)
+			.then((r) => sendResponse(r))
+			.catch((e) => sendResponse({ error: String(e?.message ?? e) }));
 		return true;
 	}
 	return undefined;
