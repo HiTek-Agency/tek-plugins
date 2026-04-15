@@ -13,6 +13,9 @@
 const DEFAULT_PORT = 52871;
 const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
+// Offscreen WORKERS context doesn't expose chrome.runtime.getManifest.
+// Keep in sync with manifest.json "version".
+const EXT_VERSION = "0.1.0";
 
 /** @type {WebSocket | null} */
 let ws = null;
@@ -115,7 +118,7 @@ async function connect() {
 		// Send hello handshake — gateway will reply with welcome
 		const hello = {
 			kind: "hello",
-			version: chrome.runtime.getManifest().version || "0.1.0",
+			version: EXT_VERSION,
 			chromeVersion: getChromeVersion(),
 			extensionId: chrome.runtime.id,
 			capabilities: ["tabs", "debugger", "scripting", "screenshot"],
