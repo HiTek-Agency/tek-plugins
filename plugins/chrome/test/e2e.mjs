@@ -100,7 +100,7 @@ const PROMPTS = [
 
 // ── helpers ──────────────────────────────────────────────────────────
 function openWs() {
-	return new WebSocket(`ws://127.0.0.1:${PORT}/`);
+	return new WebSocket(`ws://127.0.0.1:${PORT}/gateway`);
 }
 
 async function runOne(prompt, name) {
@@ -190,9 +190,12 @@ function assertContainsTool(result, toolNamePattern) {
 					(r.images.length ? null : "no image.generated emitted");
 			}
 			if (p.name === "navigate+read") {
-				assertion =
-					assertContainsTool(r, "chrome__navigate") ||
-					assertContainsTool(r, "chrome__read_page");
+				// Both tools must fire — assertContainsTool returns null on success.
+				const navMiss = assertContainsTool(r, "chrome__navigate");
+				const readMiss = assertContainsTool(r, "chrome__read_page");
+				assertion = navMiss && readMiss
+					? "expected chrome__navigate AND chrome__read_page to be called"
+					: navMiss || readMiss;
 			}
 			if (p.name === "find+click") {
 				assertion = assertContainsTool(r, "chrome__(find|click)");
