@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Tek Chrome E2E Test</title></head>
+<body>
+  <h1 id="page-title">Tek E2E Fixture</h1>
+  <p>Deterministic targets for the chrome-control end-to-end test.</p>
+  <a id="target-link" href="#clicked">Click me</a>
+  <p id="click-receipt"></p>
+  <input id="target-input" type="text" placeholder="Type here" />
+  <p id="input-mirror"></p>
+  <script>
+    document.getElementById("target-link").addEventListener("click", (e) => {
+      e.preventDefault();
+      document.getElementById("click-receipt").textContent = "CLICKED_OK";
+    });
+    document.getElementById("target-input").addEventListener("input", (e) => {
+      document.getElementById("input-mirror").textContent = "TYPED:" + e.target.value;
+    });
+    window.__tekE2E = { ready: true };
+  </script>
+</body>
+</html>
