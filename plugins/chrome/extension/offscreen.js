@@ -115,16 +115,22 @@ async function connect() {
 
 	ws.onopen = () => {
 		console.log("[tek] WS open", url);
-		// Send hello handshake — gateway will reply with welcome
+		let extensionId = null;
+		try {
+			extensionId = chrome?.runtime?.id ?? null;
+		} catch (err) {
+			console.warn("[tek] chrome.runtime.id unavailable", err);
+		}
 		const hello = {
 			kind: "hello",
 			version: EXT_VERSION,
 			chromeVersion: getChromeVersion(),
-			extensionId: chrome.runtime.id,
+			extensionId,
 			capabilities: ["tabs", "debugger", "scripting", "screenshot"],
 		};
 		try {
 			ws.send(JSON.stringify(hello));
+			console.log("[tek] hello sent", hello);
 		} catch (err) {
 			console.warn("[tek] hello send failed", err);
 		}
