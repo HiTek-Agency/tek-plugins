@@ -52,13 +52,17 @@ function setState(nextState, nextReason) {
 }
 
 async function loadAuth() {
-	const { auth, wsPort } = await chrome.storage.local.get(["auth", "wsPort"]);
-	// CONTEXT D-12: token is stored under auth.token. Back-compat: accept plain string too.
-	const token =
-		typeof auth === "string" ? auth : auth && typeof auth === "object" ? auth.token ?? null : null;
-	const port =
-		typeof wsPort === "number" && wsPort > 0 ? wsPort : DEFAULT_PORT;
-	return { token, port };
+	// Offscreen docs (reason: WORKERS) can't access chrome.storage.
+	// SW owns storage and replies to kind: "get-auth".
+	try {
+		const res = await chrome.runtime.sendMessage({ kind: "get-auth" });
+		return {
+			token: res?.token ?? null,
+			port: typeof res?.port === "number" && res.port > 0 ? res.port : DEFAULT_PORT,
+		};
+	} catch {
+		return { token: null, port: DEFAULT_PORT };
+	}
 }
 
 function scheduleReconnect() {
@@ -177,32 +181,16 @@ async function connect() {
 	};
 }
 
-async function setToken(tokenValue) {
-	// CONTEXT D-12: persist as auth.token object shape
-	await chrome.storage.local.set({ auth: { token: tokenValue } });
-	attempt = 0; // reset backoff — user just fixed auth
-	if (reconnectTimer) {
-		clearTimeout(reconnectTimer);
-		reconnectTimer = null;
-	}
-	connect();
-}
-
-async function reset() {
+async function reconnectNow() {
 	attempt = 0;
 	if (reconnectTimer) {
 		clearTimeout(reconnectTimer);
 		reconnectTimer = null;
 	}
 	if (ws) {
-		try {
-			ws.close();
-		} catch {
-			// ignore
-		}
+		try { ws.close(); } catch {}
 		ws = null;
 	}
-	// Immediately reconnect — will short-circuit to no-token if none saved.
 	connect();
 }
 
@@ -230,12 +218,9 @@ async function downscaleBase64PNG(b64, maxWidth) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
-	if (msg.kind === "set-token" && typeof msg.token === "string") {
-		setToken(msg.token).then(() => sendResponse({ ok: true }));
-		return true;
-	}
-	if (msg.kind === "reset") {
-		reset().then(() => sendResponse({ ok: true }));
+	if (msg.kind === "auth-updated") {
+		reconnectNow();
+		sendResponse({ ok: true });
 		return true;
 	}
 	if (msg.kind === "status") {

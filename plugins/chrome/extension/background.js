@@ -426,6 +426,61 @@ const TOOL_HANDLERS = {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
+
+	// Storage bridge — offscreen docs (reason: WORKERS) can't use chrome.storage,
+	// so the SW owns auth persistence. Also serves popup set-token/reset/get-auth.
+	if (msg.kind === "get-auth") {
+		chrome.storage.local.get(["auth", "wsPort"]).then((data) => {
+			const token =
+				typeof data.auth === "string"
+					? data.auth
+					: data.auth && typeof data.auth === "object"
+					? data.auth.token ?? null
+					: null;
+			const port =
+				typeof data.wsPort === "number" && data.wsPort > 0 ? data.wsPort : null;
+			sendResponse({ token, port });
+		});
+		return true;
+	}
+	if (msg.kind === "set-token" && typeof msg.token === "string") {
+		chrome.storage.local
+			.set({ auth: { token: msg.token } })
+			.then(() => {
+				// Broadcast to offscreen so it can reconnect immediately.
+				try {
+					chrome.runtime.sendMessage({ kind: "auth-updated" }).catch(() => {});
+				} catch {}
+				sendResponse({ ok: true });
+			})
+			.catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+		return true;
+	}
+	if (msg.kind === "set-port" && typeof msg.port === "number") {
+		chrome.storage.local
+			.set({ wsPort: msg.port })
+			.then(() => {
+				try {
+					chrome.runtime.sendMessage({ kind: "auth-updated" }).catch(() => {});
+				} catch {}
+				sendResponse({ ok: true });
+			})
+			.catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+		return true;
+	}
+	if (msg.kind === "reset-auth") {
+		chrome.storage.local
+			.remove(["auth", "wsPort"])
+			.then(() => {
+				try {
+					chrome.runtime.sendMessage({ kind: "auth-updated" }).catch(() => {});
+				} catch {}
+				sendResponse({ ok: true });
+			})
+			.catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+		return true;
+	}
+
 	if (msg.kind !== "call") return;
 	const handler = TOOL_HANDLERS[msg.tool];
 	if (!handler) {

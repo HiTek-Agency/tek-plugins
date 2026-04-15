@@ -88,7 +88,7 @@ saveBtn.addEventListener("click", async () => {
 
 resetBtn.addEventListener("click", async () => {
 	try {
-		await chrome.runtime.sendMessage({ kind: "reset" });
+		await chrome.runtime.sendMessage({ kind: "reset-auth" });
 	} catch (err) {
 		console.warn("[tek] reset failed", err);
 	}
