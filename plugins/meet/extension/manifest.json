@@ -13,6 +13,12 @@
 			"js": ["content-isolated.js"],
 			"run_at": "document_idle",
 			"world": "ISOLATED"
+		},
+		{
+			"matches": ["https://meet.google.com/*"],
+			"js": ["content-main-world.js"],
+			"run_at": "document_start",
+			"world": "MAIN"
 		}
 	],
 	"action": { "default_popup": "popup.html", "default_icon": "icons/48.png" },
