@@ -37,13 +37,20 @@ export function getChromeExec() {
 }
 
 /**
- * Pure argv builder — exported for unit testing. The bot opens at about:blank;
- * plan 104-04 will drive the navigation to the real Meet URL via CDP after the
- * extension completes its WS handshake with the gateway.
+ * Pure argv builder — exported for unit testing. The bot opens at about:blank
+ * by DEFAULT (plan 104-02 invariant — the MAIN-world content script must run
+ * before Meet loads per RESEARCH Pitfall 1); plan 104-04 drives the
+ * navigation to the real Meet URL via CDP after the extension completes its
+ * WS handshake.
+ *
+ * Plan 104-07 adds an opt-in `startUrl` override for the first-run bot
+ * sign-in flow (accounts.google.com). Callers that join meetings MUST stick
+ * with the about:blank default.
  */
 export function buildChromeArgs({
 	profileDir = PROFILE_DIR,
 	extensionDir = DEFAULT_EXTENSION_DIR,
+	startUrl = "about:blank",
 } = {}) {
 	return [
 		`--user-data-dir=${profileDir}`,
@@ -51,7 +58,7 @@ export function buildChromeArgs({
 		"--new-window",
 		"--no-first-run",
 		"--no-default-browser-check",
-		"about:blank",
+		startUrl,
 	];
 }
 
@@ -65,6 +72,7 @@ export async function spawnBotChrome({
 	spawnFn = realSpawn,
 	extensionDir,
 	profileDir,
+	startUrl,
 } = {}) {
 	if (_chromeProc && !_chromeProc.killed) {
 		logger.info?.("[meet] bot chrome already running; reusing");
@@ -73,7 +81,11 @@ export async function spawnBotChrome({
 	const resolvedProfileDir = profileDir ?? PROFILE_DIR;
 	mkdirSync(resolvedProfileDir, { recursive: true });
 	const exec = getChromeExec();
-	const args = buildChromeArgs({ profileDir: resolvedProfileDir, extensionDir });
+	const args = buildChromeArgs({
+		profileDir: resolvedProfileDir,
+		extensionDir,
+		startUrl,
+	});
 	logger.info?.(`[meet] spawning bot chrome: ${exec}`);
 	_chromeProc = spawnFn(exec, args, { detached: false, stdio: "ignore" });
 	if (typeof _chromeProc.on === "function") {

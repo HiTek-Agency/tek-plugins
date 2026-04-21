@@ -454,9 +454,110 @@ export async function register(ctx) {
 	if (typeof ctx.addWsHandler === "function") {
 		// Namespaced to plugin.meet.status by sandbox.
 		ctx.addWsHandler("status", statusHandler);
+
+		// Plan 104-07: desktop-initiated kick. The always-visible status chip
+		// exposes a "Kick bot" button — clicking it ends the current meeting
+		// immediately (best-effort), kills the bot Chrome profile, and resets
+		// module state. NO approval guard here: kick is a user-initiated
+		// cleanup from the desktop (the chip IS the user's approval) and must
+		// NOT route through the agent-tool approvalTier ladder.
+		ctx.addWsHandler("kick", async (msg) => {
+			const m = msg && typeof msg === "object" ? msg : {};
+			_logger.info?.(`${LOG_PREFIX} kick requested by desktop`);
+			let ok = true;
+			let errs = [];
+			// Best-effort: flush + release whisper transcriber.
+			try {
+				await _transcriber?.shutdown();
+			} catch (e) {
+				ok = false;
+				errs.push(`transcriber: ${e?.message || e}`);
+			}
+			_transcriber = null;
+			// Drop tracker state so the next join starts fresh.
+			try {
+				_tracker?.reset();
+			} catch {
+				// ignore
+			}
+			_tracker = null;
+			_meetingId = null;
+			_mode = null;
+			_meetTabId = null;
+			// Close the extension socket (if any) — triggers the content
+			// side's onclose + reconnect, but Chrome is about to die anyway.
+			try {
+				_sock?.close();
+			} catch {
+				// ignore
+			}
+			_sock = null;
+			try {
+				await stopBotChrome();
+			} catch (e) {
+				ok = false;
+				errs.push(`stopBotChrome: ${e?.message || e}`);
+			}
+			return {
+				type: "plugin.meet.kick.result",
+				id: m.id,
+				requestId: m.id,
+				ok,
+				error: errs.length ? errs.join("; ") : undefined,
+			};
+		});
+
+		// Plan 104-07: desktop-initiated first-run bot sign-in. Spawns the bot
+		// Chrome profile pointed at accounts.google.com so the user can sign
+		// the bot into a Google account once. The about:blank default is
+		// deliberate for normal Meet joins (RESEARCH Pitfall 1 — MAIN-world
+		// content script must run before Meet loads) but is wrong for sign-in;
+		// this handler navigates the freshly-spawned Chrome tab to the
+		// accounts page immediately after spawn.
+		ctx.addWsHandler("open-signin", async (msg) => {
+			const m = msg && typeof msg === "object" ? msg : {};
+			_logger.info?.(`${LOG_PREFIX} open-signin requested by desktop`);
+			try {
+				await spawnBotChrome({
+					meetUrl: "https://accounts.google.com/signin",
+					logger: _logger,
+					startUrl: "https://accounts.google.com/signin",
+				});
+				// If the extension is already handshaken (rare for a fresh
+				// profile but possible on re-sign-in), navigate the about:blank
+				// tab explicitly so the user lands on the sign-in page.
+				if (_sock) {
+					try {
+						await _rpc(
+							"meet.navigate",
+							{ url: "https://accounts.google.com/signin" },
+							10_000,
+						);
+					} catch (e) {
+						_logger.warn?.(
+							`${LOG_PREFIX} open-signin navigate skipped: ${e?.message || e}`,
+						);
+					}
+				}
+				return {
+					type: "plugin.meet.open-signin.result",
+					id: m.id,
+					requestId: m.id,
+					ok: true,
+				};
+			} catch (e) {
+				return {
+					type: "plugin.meet.open-signin.result",
+					id: m.id,
+					requestId: m.id,
+					ok: false,
+					error: e?.message || String(e),
+				};
+			}
+		});
 	} else {
 		_logger.warn?.(
-			`${LOG_PREFIX} ctx.addWsHandler unavailable — desktop status poll will be disabled`,
+			`${LOG_PREFIX} ctx.addWsHandler unavailable — desktop status/kick poll will be disabled`,
 		);
 	}
 
