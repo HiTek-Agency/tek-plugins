@@ -28,6 +28,8 @@ import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { checkConnection } from "./check-connection.js";
 import { spawnBotChrome, stopBotChrome } from "./chrome-profile.js";
+import { createTranscriber } from "./meet-transcriber.js";
+import { resolveArchiveDir, appendChunk } from "./raw-jsonl-writer.js";
 
 const TOKEN_PATH = join(homedir(), ".config", "tek", "meet.token");
 const META_PATH = join(homedir(), ".config", "tek", "meet.json");
@@ -58,6 +60,29 @@ let _mode = null; // "observer" | "participant" | null
 const _pending = new Map();
 let _seq = 0;
 let _logger = console;
+// Plan 104-03 additions — transcriber + archive lifecycle state.
+let _transcriber = null;
+let _archiveDir = null;
+let _startedAt = null;
+let _currentCtx = null;
+
+/**
+ * Default whisper model path — reuses voice-input-stt's model location so
+ * users don't have to download twice. Override via plugin config
+ * `whisperModelPath`.
+ */
+function resolveWhisperModelPath(override) {
+	if (override) return override;
+	return join(
+		homedir(),
+		".config",
+		"tek",
+		"plugins",
+		"voice-stt",
+		"models",
+		"ggml-base.en.bin",
+	);
+}
 
 export function _getActiveSocket() {
 	return _sock;
@@ -97,21 +122,77 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	}
 	_meetingId = extractMeetCode(url);
 	_mode = mode;
+	_startedAt = new Date();
+	// Plan 104-03: create the archive dir + whisper transcriber BEFORE
+	// spawning Chrome so the moment audio frames start flowing, we have
+	// somewhere to put them.
+	_archiveDir = resolveArchiveDir({
+		startedAt: _startedAt,
+		meetCode: _meetingId || "unknown",
+		title: "",
+	});
+	_logger.info?.(`${LOG_PREFIX} archive at ${_archiveDir}`);
+
+	const cfg = _currentCtx?.getConfig?.() ?? {};
+	const modelPath = resolveWhisperModelPath(cfg.whisperModelPath);
+	try {
+		_transcriber = await createTranscriber({
+			modelPath,
+			emitChunk: (chunk) => {
+				chunk.meetingId = _meetingId;
+				try {
+					appendChunk(_archiveDir, chunk);
+				} catch (e) {
+					_logger.warn?.(`${LOG_PREFIX} raw.jsonl append failed: ${e?.message || e}`);
+				}
+				// Plan 104-05 reads raw.jsonl to build transcript.md.
+				// Plan 104-06 reads it for wake-word scanning.
+				// A future gateway push API (phase 108) will broadcast
+				// meet.transcript.chunk to the desktop status chip.
+				_logger.debug?.(
+					`${LOG_PREFIX} chunk: ${String(chunk.text || "").slice(0, 80)}`,
+				);
+			},
+		});
+	} catch (e) {
+		_logger.warn?.(
+			`${LOG_PREFIX} transcriber init failed (whisper model missing?): ${e?.message || e}`,
+		);
+		// Continue without transcriber — meeting still joins, audio frames
+		// will be silently dropped but Chrome + archive dir are still set up.
+		_transcriber = null;
+	}
+
 	// Spawn bot Chrome pointed at about:blank first so the main-world content
 	// script has a chance to run before Meet loads (RESEARCH Pitfall 1).
 	// Plan 104-04 will call _rpc("join", ...) to navigate + join the call after
 	// the WS handshake completes.
 	await spawnBotChrome({ meetUrl: url, logger: _logger });
+
+	// Ask the extension to start tab-audio capture. This is best-effort —
+	// the extension SW may not yet be connected (user still loading the
+	// unpacked extension on first run); plan 104-04 will make this robust
+	// with a handshake-aware retry.
+	try {
+		await _rpc("meet.start-capture", { meetingId: _meetingId }, 60_000);
+	} catch (e) {
+		_logger.warn?.(
+			`${LOG_PREFIX} meet.start-capture RPC failed: ${e?.message || e} — plan 104-04 adds retry`,
+		);
+	}
+
 	return {
 		ok: true,
 		meetingId: _meetingId,
 		mode,
 		voiceProfileId: voiceProfileId ?? null,
-		note: "Chrome spawned; audio/DOM pipelines ship in plans 104-03 / 104-04.",
+		archiveDir: _archiveDir,
+		note: "Chrome spawned + audio pipeline armed. DOM automation lands in plan 104-04.",
 	};
 }
 
 export async function register(ctx) {
+	_currentCtx = ctx;
 	_logger = ctx.logger ?? ctx.log ?? console;
 	const cfg = ctx.getConfig?.() ?? {};
 	const port = Number(cfg.wsPort) || 52881;
@@ -167,7 +248,30 @@ export async function register(ctx) {
 				else p.resolve(msg.value);
 				return;
 			}
-			// Plans 104-03 / 104-04 / 104-05 handle audio / speaker / status push events.
+			// Plan 104-03: inbound audio frames from the extension's offscreen
+			// doc. Fire-and-forget — ingestFrame buffers internally.
+			if (msg.kind === "meet.audio.frame") {
+				if (_transcriber) {
+					_transcriber
+						.ingestFrame(msg.frame, msg.t, msg.suppressed === true)
+						.catch((e) =>
+							_logger.warn?.(
+								`${LOG_PREFIX} ingestFrame: ${e?.message || e}`,
+							),
+						);
+				}
+				return;
+			}
+			// Plan 104-03: offscreen doc hello (role-advertising). Logged but
+			// non-blocking — the main SW socket's hello remains the source of
+			// truth for handshake state.
+			if (msg.kind === "hello-offscreen") {
+				_logger.info?.(
+					`${LOG_PREFIX} offscreen connected (role=${msg.role || "unknown"})`,
+				);
+				return;
+			}
+			// Plans 104-04 / 104-05 handle speaker / status push events.
 		});
 
 		sock.on("close", () => {
@@ -245,6 +349,16 @@ export async function register(ctx) {
 
 	return {
 		cleanup: async () => {
+			// Plan 104-03: flush + release whisper BEFORE tearing down Chrome
+			// so any tail audio in the buffer still lands in raw.jsonl.
+			try {
+				await _transcriber?.shutdown();
+			} catch (e) {
+				_logger.warn?.(`${LOG_PREFIX} transcriber shutdown: ${e?.message || e}`);
+			}
+			_transcriber = null;
+			_archiveDir = null;
+			_startedAt = null;
 			try {
 				_wss?.close();
 			} catch {
@@ -260,6 +374,14 @@ export async function register(ctx) {
 }
 
 export async function cleanup() {
+	try {
+		await _transcriber?.shutdown();
+	} catch {
+		// ignore — cleanup path is best-effort
+	}
+	_transcriber = null;
+	_archiveDir = null;
+	_startedAt = null;
 	try {
 		_wss?.close();
 	} catch {
