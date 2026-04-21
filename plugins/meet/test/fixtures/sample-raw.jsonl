@@ -1,0 +1,5 @@
+{"t_start_ms":1000,"t_end_ms":2000,"text":"Good morning","speakerGuess":"Alice","source":"whisper","transcribe":true}
+{"t_start_ms":2100,"t_end_ms":3000,"text":"how is everyone","speakerGuess":"Alice","source":"whisper","transcribe":true}
+{"t_start_ms":3100,"t_end_ms":4000,"text":"Hey Alice","speakerGuess":"Bob","source":"whisper","transcribe":true}
+{"t_start_ms":4100,"t_end_ms":5000,"text":"I'm Tek here to help","speakerGuess":null,"source":"self-echo","transcribe":false}
+{"t_start_ms":5100,"t_end_ms":6000,"text":"Ready to start","speakerGuess":"Alice","source":"whisper","transcribe":true}
