@@ -1,0 +1,50 @@
+{
+	"id": "meet",
+	"name": "Google Meet",
+	"version": "0.1.0",
+	"description": "Agent joins Google Meet as observer or wake-word participant. Local whisper transcription, DOM speaker attribution, post-meeting Google Doc + summary.",
+	"entryPoint": "src/index.js",
+	"permissions": ["tools", "config", "context", "ws-handlers"],
+	"configSchema": [
+		{
+			"key": "wsPort",
+			"label": "Loopback WebSocket Port",
+			"type": "number",
+			"default": 52881,
+			"description": "Port the gateway listens on (127.0.0.1 only). The extension must use this port."
+		},
+		{
+			"key": "wakeWordPhrases",
+			"label": "Wake-Word Phrases",
+			"type": "string",
+			"default": "hey tek,tek join in",
+			"description": "Comma-separated list of phrases that flip the bot from observer to active. Case-insensitive."
+		},
+		{
+			"key": "silenceTimeoutMs",
+			"label": "Silence Before Returning to Passive",
+			"type": "number",
+			"default": 15000,
+			"description": "Milliseconds of silence after the bot stops speaking before returning to passive listen."
+		},
+		{
+			"key": "botDisplayName",
+			"label": "Bot Display Name",
+			"type": "string",
+			"default": "[Tek]",
+			"description": "Prefix added to the bot's Meet display name where Meet allows renaming."
+		},
+		{
+			"key": "whisperModelPath",
+			"label": "Whisper Model Path",
+			"type": "string",
+			"default": "",
+			"description": "Override path to the whisper GGML model. Empty = reuse voice-input-stt's model."
+		}
+	],
+	"providesTools": ["meet__join_observer", "meet__join_participant"],
+	"source": {
+		"type": "git",
+		"repo": "https://github.com/HiTek-Agency/tek-plugins"
+	}
+}
