@@ -16,6 +16,7 @@
 
 import { dispatch } from "./dispatch.js";
 import { runKeepaliveCycle, KEEPALIVE_INTERVAL_MS } from "./keepalive.js";
+import { buildChatPostCommands, buildTransparencyText } from "./chat-post.js";
 
 const EXT_VERSION = "0.1.0";
 const STORAGE_KEY = "tek_meet_connection";
@@ -92,6 +93,37 @@ function connect(meta) {
 			backoff = 1000;
 			await saveMeta({ ...meta, connected: true, lastHandshakeAt: Date.now() });
 			return;
+		}
+		// Plan 104-04: intercept specific tool calls BEFORE the pure
+		// dispatcher's "not implemented" fallback kicks in. Plan 104-02's
+		// dispatch.js is intentionally chrome-free (unit-testable); anything
+		// that needs chrome.tabs or chrome.debugger lives here instead.
+		if (msg.kind === "call" && typeof msg.tool === "string") {
+			const sendResult = (payload) => {
+				try {
+					ws.send(JSON.stringify({ kind: "result", id: msg.id, ...payload }));
+				} catch (err) {
+					console.warn("[tek-meet] WS send failed", err);
+				}
+			};
+			if (msg.tool === "meet.navigate") {
+				try {
+					const r = await navigateBotTab(msg.args || {});
+					sendResult({ value: r });
+				} catch (e) {
+					sendResult({ error: String(e?.message || e) });
+				}
+				return;
+			}
+			if (msg.tool === "meet.announce") {
+				try {
+					const r = await postTransparencyMessage(msg.args || {});
+					sendResult({ value: r });
+				} catch (e) {
+					sendResult({ error: String(e?.message || e) });
+				}
+				return;
+			}
 		}
 		await dispatch(msg, (out) => {
 			try {
@@ -282,6 +314,69 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	}
 	return undefined;
 });
+
+/* ---------- Plan 104-04: meet.navigate (CDP) + meet.announce (CDP chat post) ---------- */
+
+/**
+ * Drive the bot Chrome's about:blank tab to the Meet URL. The tab is chosen
+ * from chrome.tabs.query({url:"about:blank"}) in the bot profile (the gateway
+ * only ever spawns ONE Chrome window per meeting, so ambiguity is unlikely).
+ * Returns { ok, tabId } so the gateway can remember tabId for the announce
+ * step.
+ */
+async function navigateBotTab({ url }) {
+	if (typeof url !== "string" || !url.includes("meet.google.com/")) {
+		throw new Error("meet.navigate: invalid url");
+	}
+	const tabs = await chrome.tabs.query({ url: "about:blank" });
+	const tab = tabs?.[0];
+	if (!tab) throw new Error("meet.navigate: no about:blank tab found");
+	await chrome.tabs.update(tab.id, { url });
+	return { ok: true, tabId: tab.id };
+}
+
+/**
+ * Post the D-18 transparency message in Meet's built-in chat via CDP DOM
+ * automation. Meet has no REST chat API (verified in RESEARCH §2.3) so DOM
+ * automation is the only path. The command sequence is composed by the pure
+ * chat-post.js module (unit-tested separately); this function only executes
+ * it via chrome.debugger.
+ *
+ * Returns { ok: true } on success, { ok: false, error } on failure. Failures
+ * are NON-FATAL — the meeting still proceeds. The gateway surfaces the
+ * outcome via logs + the plugin.meet.status handler.
+ */
+async function postTransparencyMessage({ tabId, userName }) {
+	if (typeof tabId !== "number") {
+		return { ok: false, error: "meet.announce: tabId required" };
+	}
+	const text = buildTransparencyText(userName);
+	const cmds = buildChatPostCommands(text);
+	let attached = false;
+	try {
+		await chrome.debugger.attach({ tabId }, "1.3");
+		attached = true;
+		for (const cmd of cmds) {
+			if (cmd.method === "_wait") {
+				await new Promise((r) => setTimeout(r, cmd.params.ms));
+				continue;
+			}
+			await chrome.debugger.sendCommand({ tabId }, cmd.method, cmd.params);
+		}
+		return { ok: true, text };
+	} catch (e) {
+		console.warn("[tek-meet] chat-post failed", e);
+		return { ok: false, error: String(e?.message || e) };
+	} finally {
+		if (attached) {
+			try {
+				await chrome.debugger.detach({ tabId });
+			} catch {
+				// ignore — may already be detached
+			}
+		}
+	}
+}
 
 /* -------- Plan 104-04: forward content-script events to the gateway -------- */
 // content-isolated.js fires chrome.runtime.sendMessage({kind:"speaker.changed", ...})

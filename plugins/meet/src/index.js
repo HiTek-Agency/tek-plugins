@@ -175,20 +175,79 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 
 	// Spawn bot Chrome pointed at about:blank first so the main-world content
 	// script has a chance to run before Meet loads (RESEARCH Pitfall 1).
-	// Plan 104-04 will call _rpc("join", ...) to navigate + join the call after
-	// the WS handshake completes.
+	// Plan 104-04 now drives navigation + transparency announce after the
+	// WS handshake completes.
 	await spawnBotChrome({ meetUrl: url, logger: _logger });
 
-	// Ask the extension to start tab-audio capture. This is best-effort —
-	// the extension SW may not yet be connected (user still loading the
-	// unpacked extension on first run); plan 104-04 will make this robust
-	// with a handshake-aware retry.
+	// Plan 104-04: wait up to 30s for the extension SW WS handshake so we can
+	// drive it via _rpc. First-install users may take longer to load the
+	// unpacked extension + paste meta in the popup — in that case we fail
+	// soft and let the user retry join.
+	const handshakeWaitStart = Date.now();
+	while (!_sock && Date.now() - handshakeWaitStart < 30_000) {
+		await new Promise((r) => setTimeout(r, 500));
+	}
+	if (!_sock) {
+		_logger.warn?.(
+			`${LOG_PREFIX} extension handshake timed out — navigate + announce skipped`,
+		);
+		return {
+			ok: false,
+			reason: "extension-handshake-timeout",
+			meetingId: _meetingId,
+			archiveDir: _archiveDir,
+		};
+	}
+
+	// Plan 104-04: navigate the bot's about:blank tab to the Meet URL via
+	// chrome.tabs.update (SW-side). The returned tabId is what we'll attach
+	// chrome.debugger to for the chat announce.
 	try {
-		await _rpc("meet.start-capture", { meetingId: _meetingId }, 60_000);
+		const navR = await _rpc("meet.navigate", { url }, 15_000);
+		_meetTabId = navR?.tabId ?? null;
 	} catch (e) {
 		_logger.warn?.(
-			`${LOG_PREFIX} meet.start-capture RPC failed: ${e?.message || e} — plan 104-04 adds retry`,
+			`${LOG_PREFIX} meet.navigate failed: ${e?.message || e} — continuing without chat announce`,
 		);
+	}
+
+	// Ask the extension to start tab-audio capture (plan 104-03 RPC).
+	try {
+		await _rpc(
+			"meet.start-capture",
+			{ tabId: _meetTabId, meetingId: _meetingId },
+			60_000,
+		);
+	} catch (e) {
+		_logger.warn?.(
+			`${LOG_PREFIX} meet.start-capture RPC failed: ${e?.message || e}`,
+		);
+	}
+
+	// Plan 104-04: give Meet ~8s to reach the in-call UI (load, click-through,
+	// waiting-room resolution), then post the D-18 transparency message. The
+	// content-isolated.js MutationObserver is already watching for the
+	// waiting-room state; if we're still in the waiting room when we try to
+	// announce, chrome.debugger selectors will no-op (no chat panel yet) and
+	// postTransparencyMessage returns {ok:false}. That's acceptable — the
+	// meeting is already joined, just without the announce.
+	if (_meetTabId != null) {
+		await new Promise((r) => setTimeout(r, 8000));
+		const userName = resolveUserDisplayName(_currentCtx);
+		try {
+			const annR = await _rpc(
+				"meet.announce",
+				{ tabId: _meetTabId, userName },
+				30_000,
+			);
+			_logger.info?.(
+				`${LOG_PREFIX} transparency announce ok=${annR?.ok} text=${JSON.stringify(annR?.text || "")}`,
+			);
+		} catch (e) {
+			_logger.warn?.(
+				`${LOG_PREFIX} meet.announce failed: ${e?.message || e}`,
+			);
+		}
 	}
 
 	return {
@@ -197,8 +256,31 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 		mode,
 		voiceProfileId: voiceProfileId ?? null,
 		archiveDir: _archiveDir,
-		note: "Chrome spawned + audio pipeline armed. DOM automation lands in plan 104-04.",
+		tabId: _meetTabId,
+		note: "Chrome spawned + audio pipeline armed + transparency announce attempted.",
 	};
+}
+
+/**
+ * Plan 104-04: best-effort bot display-name resolver for the D-18 announce.
+ * Pulls from plugin config (`botDisplayName`), falling back to the ctx's
+ * own user-name helper (if the plugin sandbox exposes one), finally to a
+ * generic "Tek user". Plan 104-07 will wire this to the real desktop user
+ * config — for now this is a deliberate stub so joinMeet doesn't block on
+ * identity resolution.
+ */
+function resolveUserDisplayName(ctx) {
+	try {
+		const cfg = ctx?.getConfig?.() ?? {};
+		if (typeof cfg.botDisplayName === "string" && cfg.botDisplayName.length > 0) {
+			return cfg.botDisplayName;
+		}
+		const fromCtx = typeof ctx?.getUserName === "function" ? ctx.getUserName() : null;
+		if (typeof fromCtx === "string" && fromCtx.length > 0) return fromCtx;
+	} catch {
+		// ignore
+	}
+	return "Tek user";
 }
 
 export async function register(ctx) {
