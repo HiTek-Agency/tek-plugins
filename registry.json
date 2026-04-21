@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-04-01T00:00:00Z",
+  "updatedAt": "2026-04-20T00:00:00Z",
   "plugins": [
     {
       "id": "url-summarize",
@@ -35,6 +35,23 @@
       "category": "automation",
       "icon": "🌐",
       "featured": false
+    },
+    {
+      "id": "meet",
+      "name": "Google Meet",
+      "description": "Agent joins Google Meet as observer or wake-word participant — local whisper transcription, post-meeting Google Doc, desktop status chip",
+      "author": "Tek",
+      "version": "0.1.0",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/HiTek-Agency/tek-plugins",
+        "path": "plugins/meet"
+      },
+      "permissions": ["tools", "config", "context", "ws-handlers"],
+      "platforms": ["darwin"],
+      "category": "productivity",
+      "icon": "🎙️",
+      "featured": true
     },
     {
       "id": "mac-control",
