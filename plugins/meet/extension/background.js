@@ -282,3 +282,43 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	}
 	return undefined;
 });
+
+/* -------- Plan 104-04: forward content-script events to the gateway -------- */
+// content-isolated.js fires chrome.runtime.sendMessage({kind:"speaker.changed", ...})
+// and {kind:"meet.waiting-room", ...}. We translate kind → meet.speaker.changed
+// (gateway namespace) and meet.waiting-room, decorate with currentMeetingId,
+// and forward over the WS established above.
+chrome.runtime.onMessage.addListener((msg, _sender, _sendResponse) => {
+	if (!msg || typeof msg !== "object") return;
+	if (!ws || ws.readyState !== 1) return; // WS not up — drop event
+	if (msg.kind === "speaker.changed") {
+		try {
+			ws.send(
+				JSON.stringify({
+					kind: "meet.speaker.changed",
+					name: msg.name ?? null,
+					matchedSelector: msg.matchedSelector ?? null,
+					at: typeof msg.at === "number" ? msg.at : Date.now(),
+					meetingId: currentMeetingId,
+				}),
+			);
+		} catch (e) {
+			console.warn("[tek-meet] speaker.changed forward failed", e);
+		}
+		return;
+	}
+	if (msg.kind === "meet.waiting-room") {
+		try {
+			ws.send(
+				JSON.stringify({
+					kind: "meet.waiting-room",
+					at: typeof msg.at === "number" ? msg.at : Date.now(),
+					meetingId: currentMeetingId,
+				}),
+			);
+		} catch (e) {
+			console.warn("[tek-meet] waiting-room forward failed", e);
+		}
+		return;
+	}
+});

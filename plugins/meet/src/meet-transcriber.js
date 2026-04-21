@@ -46,12 +46,14 @@ const FALLBACK_WINDOW_MS = 5000;
  * @param {(c:TranscriberChunk) => void} opts.emitChunk  called per completed chunk
  * @param {(o:object) => Promise<any>} [opts.initWhisperFn]  override for tests — defaults to dynamic @fugood/whisper.node import
  * @param {number} [opts.vadThreshold=500]
+ * @param {() => (string|null)} [opts.getSpeaker]   plan 104-04: called at each flush to read the current DOM-scraped speaker; return value becomes chunk.speakerGuess. Defaults to always-null.
  */
 export async function createTranscriber({
 	modelPath,
 	emitChunk,
 	initWhisperFn,
 	vadThreshold = 500,
+	getSpeaker = () => null,
 }) {
 	const init =
 		initWhisperFn ??
@@ -108,21 +110,37 @@ export async function createTranscriber({
 				.join(" ")
 				.trim();
 			if (text) {
+				// Plan 104-04: stamp the live DOM-scraped speaker into the chunk.
+				// getSpeaker() returns null when no MutationObserver event has
+				// fired yet or when no selector matched — both are correct; a
+				// null speakerGuess is the honest signal.
+				let speakerGuess = null;
+				try {
+					speakerGuess = getSpeaker() ?? null;
+				} catch {
+					speakerGuess = null;
+				}
 				emitChunk({
 					t_start_ms,
 					t_end_ms,
 					text,
-					speakerGuess: null,
+					speakerGuess,
 					source: suppressed ? "self-echo" : "whisper",
 					transcribe: !suppressed,
 				});
 			}
 		} catch (e) {
+			let speakerGuess = null;
+			try {
+				speakerGuess = getSpeaker() ?? null;
+			} catch {
+				speakerGuess = null;
+			}
 			emitChunk({
 				t_start_ms,
 				t_end_ms,
 				text: "",
-				speakerGuess: null,
+				speakerGuess,
 				source: "whisper",
 				transcribe: false,
 				error: e?.message || String(e),

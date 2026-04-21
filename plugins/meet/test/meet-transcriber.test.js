@@ -170,3 +170,76 @@ test("transcriber emits error chunk when whisper throws", async () => {
 	assert.equal(errChunk.transcribe, false);
 	assert.match(errChunk.error, /gpu-oom/);
 });
+
+test("plan 104-04: getSpeaker callback stamps speakerGuess into each emitted chunk", async () => {
+	let currentSpeaker = null;
+	const fakeCtx = {
+		transcribeData: () => ({
+			stop() {},
+			promise: Promise.resolve({ segments: [{ text: "hello" }] }),
+		}),
+		release: async () => {},
+	};
+	const chunks = [];
+	const t = await createTranscriber({
+		modelPath: "/n",
+		emitChunk: (c) => chunks.push(c),
+		initWhisperFn: async () => fakeCtx,
+		getSpeaker: () => currentSpeaker,
+	});
+	// First chunk while no speaker is known → speakerGuess null
+	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	// Now simulate a DOM speaker.changed event — tracker updates its state
+	currentSpeaker = "Alice";
+	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	await t.shutdown();
+	assert.ok(chunks.length >= 2, `expected ≥2 chunks, got ${chunks.length}`);
+	assert.equal(chunks[0].speakerGuess, null, "first chunk predates speaker event");
+	const aliceChunk = chunks.find((c) => c.speakerGuess === "Alice");
+	assert.ok(aliceChunk, "a chunk after speaker event should be tagged 'Alice'");
+});
+
+test("plan 104-04: getSpeaker defaults to null-returning fn when not passed", async () => {
+	const fakeCtx = {
+		transcribeData: () => ({
+			stop() {},
+			promise: Promise.resolve({ segments: [{ text: "x" }] }),
+		}),
+		release: async () => {},
+	};
+	const chunks = [];
+	// No getSpeaker — default should keep speakerGuess null (baseline behavior)
+	const t = await createTranscriber({
+		modelPath: "/n",
+		emitChunk: (c) => chunks.push(c),
+		initWhisperFn: async () => fakeCtx,
+	});
+	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	await t.shutdown();
+	assert.ok(chunks.length >= 1);
+	assert.equal(chunks[0].speakerGuess, null);
+});
+
+test("plan 104-04: getSpeaker throwing doesn't break emission — speakerGuess falls back to null", async () => {
+	const fakeCtx = {
+		transcribeData: () => ({
+			stop() {},
+			promise: Promise.resolve({ segments: [{ text: "x" }] }),
+		}),
+		release: async () => {},
+	};
+	const chunks = [];
+	const t = await createTranscriber({
+		modelPath: "/n",
+		emitChunk: (c) => chunks.push(c),
+		initWhisperFn: async () => fakeCtx,
+		getSpeaker: () => {
+			throw new Error("tracker-exploded");
+		},
+	});
+	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	await t.shutdown();
+	assert.ok(chunks.length >= 1);
+	assert.equal(chunks[0].speakerGuess, null);
+	assert.equal(chunks[0].text, "x");
+});

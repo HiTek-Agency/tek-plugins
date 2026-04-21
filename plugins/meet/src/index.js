@@ -30,6 +30,7 @@ import { checkConnection } from "./check-connection.js";
 import { spawnBotChrome, stopBotChrome } from "./chrome-profile.js";
 import { createTranscriber } from "./meet-transcriber.js";
 import { resolveArchiveDir, appendChunk } from "./raw-jsonl-writer.js";
+import { createSpeakerTracker } from "./speaker-tracker.js";
 
 const TOKEN_PATH = join(homedir(), ".config", "tek", "meet.token");
 const META_PATH = join(homedir(), ".config", "tek", "meet.json");
@@ -65,6 +66,9 @@ let _transcriber = null;
 let _archiveDir = null;
 let _startedAt = null;
 let _currentCtx = null;
+// Plan 104-04 additions — speaker tracker + bot tab id (for CDP chat-post).
+let _tracker = null;
+let _meetTabId = null;
 
 /**
  * Default whisper model path — reuses voice-input-stt's model location so
@@ -133,11 +137,17 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	});
 	_logger.info?.(`${LOG_PREFIX} archive at ${_archiveDir}`);
 
+	// Plan 104-04: speaker tracker — fed by meet.speaker.changed events from
+	// the DOM MutationObserver in content-isolated.js. The transcriber reads
+	// getSpeaker() at each flush to tag chunks with the live best-guess.
+	_tracker = createSpeakerTracker();
+
 	const cfg = _currentCtx?.getConfig?.() ?? {};
 	const modelPath = resolveWhisperModelPath(cfg.whisperModelPath);
 	try {
 		_transcriber = await createTranscriber({
 			modelPath,
+			getSpeaker: () => _tracker?.getCurrent().name ?? null,
 			emitChunk: (chunk) => {
 				chunk.meetingId = _meetingId;
 				try {
@@ -271,7 +281,28 @@ export async function register(ctx) {
 				);
 				return;
 			}
-			// Plans 104-04 / 104-05 handle speaker / status push events.
+			// Plan 104-04: DOM-scraped active-speaker update from
+			// content-isolated.js via the SW. Feeds the tracker; subsequent
+			// whisper flushes read tracker.getCurrent().name for speakerGuess.
+			// msg.name may be null — that's correct (no selector matched →
+			// speakerGuess:null is the honest signal).
+			if (msg.kind === "meet.speaker.changed") {
+				const at = typeof msg.at === "number" ? msg.at : Date.now();
+				_tracker?.setCurrent(msg.name ?? null, at);
+				return;
+			}
+			// Plan 104-04: Meet waiting-room state — the bot landed in the
+			// "Asking to join / host will let you in" UI. We do NOT force-click
+			// Ask-to-join (that's a user action). Plan 104-07's desktop status
+			// chip will surface this so the user can approve or decline.
+			if (msg.kind === "meet.waiting-room") {
+				_logger.info?.(
+					`${LOG_PREFIX} waiting-room detected (meetingId=${msg.meetingId || _meetingId || "?"})`,
+				);
+				return;
+			}
+			// Plans 104-05 / 104-06 handle additional push events (wake-word,
+			// TTS ack, etc.).
 		});
 
 		sock.on("close", () => {
@@ -359,6 +390,10 @@ export async function register(ctx) {
 			_transcriber = null;
 			_archiveDir = null;
 			_startedAt = null;
+			// Plan 104-04: drop tracker state so the next join starts fresh.
+			_tracker?.reset();
+			_tracker = null;
+			_meetTabId = null;
 			try {
 				_wss?.close();
 			} catch {
@@ -382,6 +417,10 @@ export async function cleanup() {
 	_transcriber = null;
 	_archiveDir = null;
 	_startedAt = null;
+	// Plan 104-04: drop tracker state.
+	_tracker?.reset();
+	_tracker = null;
+	_meetTabId = null;
 	try {
 		_wss?.close();
 	} catch {
