@@ -15,13 +15,24 @@
  */
 
 import { dispatch } from "./dispatch.js";
+import { runKeepaliveCycle, KEEPALIVE_INTERVAL_MS } from "./keepalive.js";
 
 const EXT_VERSION = "0.1.0";
 const STORAGE_KEY = "tek_meet_connection";
+const OFFSCREEN_URL = "offscreen.html";
+const KEEPALIVE_ALARM = "tek-meet-keepalive";
 
 let ws = null;
 let backoff = 1000;
 let connected = false;
+
+// Plan 104-03: tabCapture + offscreen-doc lifecycle state.
+// currentMeetingTabId survives SW restarts via chrome.storage? — NO, we rely
+// on the keepalive cycle to detect drops and the gateway to re-issue a
+// meet.start-capture call if the SW was reaped mid-meeting. Keeping it
+// module-local is fine for the MVP.
+let currentMeetingTabId = null;
+let currentMeetingId = null;
 
 async function loadMeta() {
 	const r = await chrome.storage.local.get(STORAGE_KEY);
@@ -150,4 +161,124 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(async () => {
 	const meta = await loadMeta();
 	if (meta?.port && meta?.token) connect(meta);
+});
+
+/* ---------------- Plan 104-03: tabCapture + offscreen doc lifecycle ---------------- */
+
+async function hasOffscreenDoc() {
+	if (typeof chrome.offscreen?.hasDocument === "function") {
+		try {
+			return await chrome.offscreen.hasDocument();
+		} catch {
+			// fall through
+		}
+	}
+	if (typeof chrome.runtime?.getContexts === "function") {
+		try {
+			const contexts = await chrome.runtime.getContexts({
+				contextTypes: ["OFFSCREEN_DOCUMENT"],
+			});
+			return Array.isArray(contexts) && contexts.length > 0;
+		} catch {
+			return false;
+		}
+	}
+	return false;
+}
+
+async function ensureOffscreen() {
+	if (await hasOffscreenDoc()) return;
+	await chrome.offscreen.createDocument({
+		url: OFFSCREEN_URL,
+		reasons: ["USER_MEDIA"],
+		justification: "Tek Meet tab audio capture + mic injection",
+	});
+}
+
+async function startMeetCapture({ tabId, meetingId }) {
+	currentMeetingTabId = tabId;
+	currentMeetingId = meetingId;
+	// chrome.tabCapture.getMediaStreamId is ONLY callable from the SW
+	// (or the owner tab's content script) and must be resolved BEFORE the
+	// offscreen doc calls getUserMedia.
+	const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+	await ensureOffscreen();
+	const meta = await loadMeta();
+	// Offscreen doc listens on chrome.runtime.onMessage. Response is the ack
+	// from startCapture().
+	const ack = await chrome.runtime.sendMessage({
+		kind: "start-capture",
+		streamId,
+		meetingId,
+		meta,
+	});
+	if (!ack?.ok) {
+		throw new Error(`offscreen start-capture failed: ${ack?.error || "no-ack"}`);
+	}
+	// chrome.alarms periodInMinutes minimum is normally 0.5 in production
+	// Chrome but the keepalive value is 25 s. Chrome honors smaller values
+	// only in unpacked / developer builds; the keepalive module guards the
+	// ping/pong timing independently so an over-slow alarm just extends
+	// the hibernation window — it doesn't corrupt state.
+	chrome.alarms.create(KEEPALIVE_ALARM, {
+		periodInMinutes: KEEPALIVE_INTERVAL_MS / 60_000,
+	});
+	return { ok: true, meetingId, streamId };
+}
+
+async function stopMeetCapture() {
+	try {
+		await chrome.runtime.sendMessage({ kind: "stop-capture" });
+	} catch {
+		// offscreen may already be gone
+	}
+	chrome.alarms.clear(KEEPALIVE_ALARM).catch(() => {});
+	try {
+		await chrome.offscreen.closeDocument();
+	} catch {
+		// ignore
+	}
+	currentMeetingTabId = null;
+	currentMeetingId = null;
+}
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+	if (alarm.name !== KEEPALIVE_ALARM) return;
+	await runKeepaliveCycle({
+		sendPing: () => chrome.runtime.sendMessage({ kind: "keepalive-ping" }),
+		recreate: async () => {
+			try {
+				await chrome.offscreen.closeDocument();
+			} catch {
+				// ignore — may already be gone
+			}
+			if (currentMeetingTabId != null && currentMeetingId != null) {
+				await startMeetCapture({
+					tabId: currentMeetingTabId,
+					meetingId: currentMeetingId,
+				});
+			}
+		},
+	});
+});
+
+// Route inbound gateway-triggered capture starts through this handler.
+// The gateway calls _rpc("meet.start-capture", {tabId, meetingId}); the pure
+// dispatcher forwards unknown tools as { kind:"call", tool, args } — we
+// short-circuit "meet.start-capture" here before it reaches dispatch.js.
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+	if (!msg || typeof msg !== "object") return;
+	if (msg.kind === "meet.start-capture") {
+		startMeetCapture({ tabId: msg.tabId, meetingId: msg.meetingId })
+			.then((r) => sendResponse(r))
+			.catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+		return true;
+	}
+	if (msg.kind === "meet.stop-capture") {
+		stopMeetCapture()
+			.then(() => sendResponse({ ok: true }))
+			.catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
+		return true;
+	}
+	return undefined;
 });
