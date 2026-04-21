@@ -31,6 +31,11 @@ import { spawnBotChrome, stopBotChrome } from "./chrome-profile.js";
 import { createTranscriber } from "./meet-transcriber.js";
 import { resolveArchiveDir, appendChunk } from "./raw-jsonl-writer.js";
 import { createSpeakerTracker } from "./speaker-tracker.js";
+// Plan 104-05 additions — post-meeting pipeline.
+import { finalize as finalizeArchive } from "./archive-writer.js";
+import { writeSummaryMd } from "./summarize.js";
+import { createMeetingDoc } from "./doc-creator.js";
+import { startReconciliation } from "./meet-reconciler.js";
 
 const TOKEN_PATH = join(homedir(), ".config", "tek", "meet.token");
 const META_PATH = join(homedir(), ".config", "tek", "meet.json");
@@ -69,6 +74,9 @@ let _currentCtx = null;
 // Plan 104-04 additions — speaker tracker + bot tab id (for CDP chat-post).
 let _tracker = null;
 let _meetTabId = null;
+// Plan 104-05 additions — captured at joinMeet, consumed by onMeetingEnd.
+let _meetUrl = null;
+let _meetingTitle = "";
 
 /**
  * Default whisper model path — reuses voice-input-stt's model location so
@@ -127,6 +135,10 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	_meetingId = extractMeetCode(url);
 	_mode = mode;
 	_startedAt = new Date();
+	// Plan 104-05: keep the URL + title around so onMeetingEnd can stamp them
+	// into meta.json without re-deriving from cfg.
+	_meetUrl = url;
+	_meetingTitle = "";
 	// Plan 104-03: create the archive dir + whisper transcriber BEFORE
 	// spawning Chrome so the moment audio frames start flowing, we have
 	// somewhere to put them.
@@ -283,6 +295,170 @@ function resolveUserDisplayName(ctx) {
 	return "Tek user";
 }
 
+/**
+ * Plan 104-05: post-meeting pipeline driven by the end-of-meeting hook.
+ *
+ * Called from two places:
+ *   1. The content-script-driven WS event {kind:"meet.in-call-ended"} — Meet
+ *      URL no longer matches the in-call shape, or the "Leave call" button
+ *      disappeared. This is the normal path.
+ *   2. The cleanup() export, as a fallback for graceful plugin unload.
+ *
+ * Produces (in order, each step non-fatal):
+ *   1. transcript.md + meta.json via archive-writer.finalize() — synchronous
+ *      I/O over raw.jsonl. Must complete before the Doc call so we have
+ *      something to embed.
+ *   2. summary.md via summarize.writeSummaryMd() — placeholder per deviation
+ *      policy; real LLM wiring lands in plan 104-09.
+ *   3. Google Doc via doc-creator.createMeetingDoc() — best-effort. Today
+ *      the plugin sandbox does NOT expose ctx.getGoogleAuth(); this call
+ *      is a no-op + warn log. Plan 104-09 wires the real auth path.
+ *   4. End-of-meeting chat post in Meet via the existing meet.announce RPC —
+ *      best-effort; fails silently if the tab is already gone.
+ *   5. startReconciliation() — fire-and-forget background job; does NOT block
+ *      onMeetingEnd's return.
+ *
+ * After all of the above, clears meeting state so a stale onMeetingEnd
+ * doesn't double-finalize.
+ */
+async function onMeetingEnd({ endedAt = new Date() } = {}) {
+	if (!_archiveDir || !_meetingId || !_startedAt) {
+		_logger.warn?.(`${LOG_PREFIX} onMeetingEnd called without active meeting state`);
+		return;
+	}
+	_logger.info?.(`${LOG_PREFIX} meeting ended; finalizing ${_archiveDir}`);
+
+	const meetUrl = _meetUrl || "";
+	const title = _meetingTitle || "";
+	const participants =
+		_tracker
+			?.history()
+			.map((h) => h.name)
+			.filter(Boolean)
+			.filter((v, i, a) => a.indexOf(v) === i) || [];
+
+	// Step 1 — archive-writer.finalize
+	let archiveResult = null;
+	try {
+		archiveResult = await finalizeArchive({
+			archiveDir: _archiveDir,
+			meta: {
+				meetUrl,
+				meetCode: _meetingId,
+				title,
+				startedAt: _startedAt.getTime(),
+				endedAt: endedAt.getTime(),
+				participants,
+			},
+		});
+	} catch (e) {
+		_logger.warn?.(`${LOG_PREFIX} finalize failed: ${e?.message || e}`);
+	}
+
+	// Step 2 — summary placeholder
+	try {
+		writeSummaryMd(_archiveDir, {
+			title,
+			startedAt: _startedAt.getTime(),
+			endedAt: endedAt.getTime(),
+			groups: archiveResult?.groups || [],
+			chunks: archiveResult?.chunks || [],
+		});
+	} catch (e) {
+		_logger.warn?.(`${LOG_PREFIX} writeSummaryMd failed: ${e?.message || e}`);
+	}
+
+	// Step 3 — Google Doc (best-effort). ctx.getGoogleAuth is scheduled for plan 104-09.
+	let docUrl = null;
+	try {
+		const auth = await _currentCtx?.getGoogleAuth?.();
+		if (auth) {
+			const summaryMd = readFileSync(join(_archiveDir, "summary.md"), "utf8");
+			const transcriptMd = readFileSync(join(_archiveDir, "transcript.md"), "utf8");
+			const dateSlice = _startedAt.toISOString().slice(0, 10);
+			const docTitle = `${title || _meetingId} — ${dateSlice}`;
+			const { documentId, url } = await createMeetingDoc({
+				auth,
+				title: docTitle,
+				summaryMd,
+				transcriptMd,
+			});
+			docUrl = url;
+			_logger.info?.(`${LOG_PREFIX} created doc ${documentId}`);
+		} else {
+			_logger.warn?.(
+				`${LOG_PREFIX} no google auth available — skipping Doc creation (plan 104-09 will wire ctx.getGoogleAuth)`,
+			);
+		}
+	} catch (e) {
+		_logger.warn?.(`${LOG_PREFIX} Doc creation failed: ${e?.message || e}`);
+	}
+
+	// Step 4 — end-of-meeting chat post. meet.announce only knows how to post
+	// the D-18 transparency text today; re-posting it at meeting end leaves a
+	// visible marker in Meet chat that the bot wrote the archive. A future
+	// SW-side extension of the announce handler can accept an override text
+	// (archive + docUrl) — tracked for plan 104-09.
+	if (_meetTabId != null) {
+		try {
+			await _rpc(
+				"meet.announce",
+				{ tabId: _meetTabId, userName: "Tek" },
+				10_000,
+			).catch(() => {});
+		} catch {
+			// ignore — meet.announce is best-effort
+		}
+	}
+	_logger.info?.(
+		`${LOG_PREFIX} archive at ${_archiveDir}${docUrl ? ` · Doc: ${docUrl}` : ""}`,
+	);
+
+	// Step 5 — async reconciliation (fire-and-forget).
+	if (typeof _currentCtx?.getGoogleAuth === "function") {
+		const archiveDirSnapshot = _archiveDir;
+		const meetingCodeSnapshot = _meetingId;
+		const startedAtSnapshot = _startedAt;
+		_currentCtx
+			.getGoogleAuth()
+			.then((auth) => {
+				if (!auth) return;
+				return startReconciliation({
+					meetingCode: meetingCodeSnapshot,
+					startedAt: startedAtSnapshot,
+					archiveDir: archiveDirSnapshot,
+					auth,
+				}).then(({ promise }) =>
+					promise
+						.then((r) =>
+							_logger.info?.(`${LOG_PREFIX} reconciliation: ${r.status}`),
+						)
+						.catch((e) =>
+							_logger.warn?.(
+								`${LOG_PREFIX} reconciliation error: ${e?.message || e}`,
+							),
+						),
+				);
+			})
+			.catch(() => {});
+	}
+
+	// Clear meeting state so future joins don't re-trigger on a stale state.
+	_meetingId = null;
+	_mode = null;
+	_archiveDir = null;
+	_startedAt = null;
+	_meetUrl = null;
+	_meetingTitle = "";
+	try {
+		await _transcriber?.shutdown?.();
+	} catch {
+		// ignore — best-effort
+	}
+	_transcriber = null;
+	_tracker?.reset();
+}
+
 export async function register(ctx) {
 	_currentCtx = ctx;
 	_logger = ctx.logger ?? ctx.log ?? console;
@@ -383,8 +559,21 @@ export async function register(ctx) {
 				);
 				return;
 			}
-			// Plans 104-05 / 104-06 handle additional push events (wake-word,
-			// TTS ack, etc.).
+			// Plan 104-05: Meet in-call state ended — content-isolated.js detected
+			// the "Leave call" button vanished or the URL changed back to the
+			// meet.google.com base. Drives the post-meeting pipeline (finalize +
+			// summary + Doc + reconciler). Fire-and-forget so the socket stays
+			// responsive to in-flight responses.
+			if (msg.kind === "meet.in-call-ended") {
+				const endedAt = msg.at
+					? new Date(msg.at)
+					: new Date();
+				onMeetingEnd({ endedAt }).catch((e) =>
+					_logger.warn?.(`${LOG_PREFIX} onMeetingEnd: ${e?.message || e}`),
+				);
+				return;
+			}
+			// Plans 104-06 handle additional push events (wake-word, TTS ack, etc.).
 		});
 
 		sock.on("close", () => {
@@ -592,6 +781,11 @@ export async function register(ctx) {
 }
 
 export async function cleanup() {
+	// Plan 104-05: if a meeting is still active on unload, finalize first so
+	// the archive + summary land before we tear down whisper + Chrome.
+	if (_archiveDir && _meetingId && _startedAt) {
+		await onMeetingEnd().catch(() => {});
+	}
 	try {
 		await _transcriber?.shutdown();
 	} catch {
