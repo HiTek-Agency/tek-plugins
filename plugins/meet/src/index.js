@@ -1,39 +1,273 @@
-// Tek Meet — gateway-side (plan 104-01b SCAFFOLD). Plan 104-02 replaces this file with real behavior.
-// IMPORTANT: approvalTier values ARE NOT placeholders — they are locked-in per CONTEXT D-02 + checker blocker-3.
-//   - join_observer: "session" (tab audio only, no mic exposure — one approval per session is enough)
-//   - join_participant: "always" (mic exposure — approve every use)
+/**
+ * Tek Meet plugin — gateway-side (Plan 104-02).
+ *
+ * Opens a loopback WebSocket server on 127.0.0.1 with a 32-byte hex token
+ * (persisted at ~/.config/tek/meet.token, mode 0600), advertises {port, token}
+ * at ~/.config/tek/meet.json for the extension popup to read, and registers
+ * two agent tools with ASYMMETRIC approval tiers per CONTEXT D-02 + checker
+ * blocker-3:
+ *   - meet__join_observer    (session tier — tab audio only)
+ *   - meet__join_participant (always tier — mic exposure)
+ *
+ * Mirrors the chrome-control plugin's WS server + hello/welcome handshake
+ * shape (see ../../../chrome/src/index.js). Plans 104-03..104-06 will wire
+ * audio capture, CDP navigation, DOM scraping, wake-word, and TTS on top of
+ * the channel this plan proves.
+ */
+
+import { WebSocketServer } from "ws";
+import { randomBytes } from "node:crypto";
+import {
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	writeFileSync,
+	chmodSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { join, dirname } from "node:path";
+import { checkConnection } from "./check-connection.js";
+import { spawnBotChrome, stopBotChrome } from "./chrome-profile.js";
+
+const TOKEN_PATH = join(homedir(), ".config", "tek", "meet.token");
+const META_PATH = join(homedir(), ".config", "tek", "meet.json");
+const LOG_PREFIX = "[meet]";
+
+function getOrCreateToken() {
+	mkdirSync(dirname(TOKEN_PATH), { recursive: true });
+	if (existsSync(TOKEN_PATH)) {
+		const t = readFileSync(TOKEN_PATH, "utf8").trim();
+		if (t.length === 64) return t;
+	}
+	const t = randomBytes(32).toString("hex");
+	writeFileSync(TOKEN_PATH, t, { mode: 0o600 });
+	try {
+		chmodSync(TOKEN_PATH, 0o600);
+	} catch {
+		// ignore chmod errors on non-POSIX
+	}
+	return t;
+}
+
+// Module-level state (same pattern as chrome plugin)
+let _wss = null;
+let _sock = null;
+let _lastHandshakeAt = null;
+let _meetingId = null;
+let _mode = null; // "observer" | "participant" | null
+const _pending = new Map();
+let _seq = 0;
+let _logger = console;
+
+export function _getActiveSocket() {
+	return _sock;
+}
+
+export function _rpc(tool, args, timeoutMs = 30_000) {
+	if (!_sock) return Promise.reject(new Error("meet extension not connected"));
+	const id = ++_seq;
+	_sock.send(JSON.stringify({ id, kind: "call", tool, args }));
+	return new Promise((resolve, reject) => {
+		const t = setTimeout(() => {
+			_pending.delete(id);
+			reject(new Error(`${tool} timed out after ${timeoutMs}ms`));
+		}, timeoutMs);
+		_pending.set(id, {
+			resolve: (v) => {
+				clearTimeout(t);
+				resolve(v);
+			},
+			reject: (e) => {
+				clearTimeout(t);
+				reject(e);
+			},
+			timer: t,
+		});
+	});
+}
+
+function extractMeetCode(url) {
+	const m = url.match(/meet\.google\.com\/([a-z0-9-]+)/i);
+	return m ? m[1] : null;
+}
+
+async function joinMeet({ url, voiceProfileId }, mode) {
+	if (typeof url !== "string" || !url.includes("meet.google.com/")) {
+		return { ok: false, reason: "invalid-url" };
+	}
+	_meetingId = extractMeetCode(url);
+	_mode = mode;
+	// Spawn bot Chrome pointed at about:blank first so the main-world content
+	// script has a chance to run before Meet loads (RESEARCH Pitfall 1).
+	// Plan 104-04 will call _rpc("join", ...) to navigate + join the call after
+	// the WS handshake completes.
+	await spawnBotChrome({ meetUrl: url, logger: _logger });
+	return {
+		ok: true,
+		meetingId: _meetingId,
+		mode,
+		voiceProfileId: voiceProfileId ?? null,
+		note: "Chrome spawned; audio/DOM pipelines ship in plans 104-03 / 104-04.",
+	};
+}
+
 export async function register(ctx) {
-	const logger = ctx.log ?? console;
-	logger.info?.("[meet] plugin loaded (scaffold — no behavior yet; see plan 104-02)");
+	_logger = ctx.logger ?? ctx.log ?? console;
+	const cfg = ctx.getConfig?.() ?? {};
+	const port = Number(cfg.wsPort) || 52881;
+	const token = getOrCreateToken();
+
+	// Persist { port, token } for the extension popup + desktop UI to read.
+	mkdirSync(dirname(META_PATH), { recursive: true });
+	writeFileSync(META_PATH, JSON.stringify({ port, token }, null, 2), { mode: 0o600 });
+	try {
+		chmodSync(META_PATH, 0o600);
+	} catch {
+		// ignore
+	}
+
+	_wss = new WebSocketServer({
+		host: "127.0.0.1",
+		port,
+		verifyClient: (info, cb) => {
+			const r = checkConnection(info.req.socket.remoteAddress, info.req.url, token);
+			if (!r.ok) {
+				_logger.warn?.(`${LOG_PREFIX} rejected connection: ${r.reason}`);
+				return cb(false, r.code, r.reason);
+			}
+			cb(true);
+		},
+	});
+
+	_wss.on("connection", (sock) => {
+		_sock = sock;
+		_lastHandshakeAt = Date.now();
+		_logger.info?.(`${LOG_PREFIX} extension connected`);
+		sock.send(JSON.stringify({ kind: "welcome", serverVersion: "0.1.0" }));
+
+		sock.on("message", (raw) => {
+			_lastHandshakeAt = Date.now();
+			let msg;
+			try {
+				msg = JSON.parse(raw.toString());
+			} catch {
+				return;
+			}
+			if (msg.kind === "hello") {
+				_logger.info?.(
+					`${LOG_PREFIX} hello from ext v${msg.extVersion} chrome ${msg.chromeVersion}`,
+				);
+				return;
+			}
+			if (msg.kind === "result" && typeof msg.id === "number") {
+				const p = _pending.get(msg.id);
+				if (!p) return;
+				_pending.delete(msg.id);
+				if (msg.error) p.reject(new Error(msg.error));
+				else p.resolve(msg.value);
+				return;
+			}
+			// Plans 104-03 / 104-04 / 104-05 handle audio / speaker / status push events.
+		});
+
+		sock.on("close", () => {
+			if (_sock === sock) _sock = null;
+			_logger.info?.(`${LOG_PREFIX} extension disconnected`);
+		});
+	});
+
+	_logger.info?.(`${LOG_PREFIX} WS server listening on 127.0.0.1:${port}`);
+
+	// Register the two agent tools with ASYMMETRIC approval tiers per CONTEXT D-02
+	// + checker blocker-3. Observer = "session" (tab audio only, no mic exposure,
+	// one approval per work session). Participant = "always" (mic exposure when
+	// wake-word fires — approve every use).
 	ctx.addTool(
 		"join_observer",
 		{
 			description:
-				"Join a Google Meet as a silent observer (SCAFFOLD — not yet implemented). Tab audio only; no mic exposure.",
+				"Join a Google Meet URL as a silent observer. The bot transcribes locally, announces itself in Meet chat, writes a transcript archive to ~/.config/tek/meet-transcripts/, creates a Google Doc with summary, and leaves cleanly at meeting end. Captures tab audio only — no mic exposure.",
 			inputSchema: {
 				type: "object",
-				properties: { url: { type: "string" } },
+				properties: {
+					url: { type: "string", description: "Full meet.google.com URL" },
+				},
 				required: ["url"],
 			},
-			execute: async () => ({ ok: false, reason: "scaffold-only" }),
+			execute: async (args) => joinMeet(args, "observer"),
 		},
 		{ approvalTier: "session" },
 	);
+
 	ctx.addTool(
 		"join_participant",
 		{
 			description:
-				"Join a Google Meet with wake-word participant mode (SCAFFOLD — not yet implemented). Mic exposure when wake-word fires.",
+				"Join a Google Meet URL as a wake-word participant. Starts in passive observer mode; flips to active on wake-word phrase ('hey tek' by default) and speaks responses via a synthetic mic. Returns to passive after 15s of silence. Everything observer does is also done. MIC EXPOSURE — always-approve tier because bot can speak into the meeting.",
 			inputSchema: {
 				type: "object",
 				properties: {
 					url: { type: "string" },
-					voiceProfileId: { type: "string" },
+					voiceProfileId: {
+						type: "string",
+						description: "Optional voice profile id from config.voiceProfiles[]",
+					},
 				},
 				required: ["url"],
 			},
-			execute: async () => ({ ok: false, reason: "scaffold-only" }),
+			execute: async (args) => joinMeet(args, "participant"),
 		},
 		{ approvalTier: "always" },
 	);
+
+	// Desktop status chip + agent introspection via plugin.meet.status WS handler.
+	const statusHandler = async (msg) => {
+		const m = msg && typeof msg === "object" ? msg : {};
+		return {
+			type: "plugin.meet.status.result",
+			id: m.id,
+			requestId: m.id,
+			connected: _sock !== null,
+			meetingId: _meetingId,
+			mode: _mode,
+			lastHandshakeAt: _lastHandshakeAt,
+			port,
+		};
+	};
+	if (typeof ctx.addWsHandler === "function") {
+		// Namespaced to plugin.meet.status by sandbox.
+		ctx.addWsHandler("status", statusHandler);
+	} else {
+		_logger.warn?.(
+			`${LOG_PREFIX} ctx.addWsHandler unavailable — desktop status poll will be disabled`,
+		);
+	}
+
+	return {
+		cleanup: async () => {
+			try {
+				_wss?.close();
+			} catch {
+				// ignore
+			}
+			_wss = null;
+			_sock = null;
+			_lastHandshakeAt = null;
+			_pending.clear();
+			await stopBotChrome().catch(() => {});
+		},
+	};
+}
+
+export async function cleanup() {
+	try {
+		_wss?.close();
+	} catch {
+		// ignore
+	}
+	_wss = null;
+	_sock = null;
+	_lastHandshakeAt = null;
+	_pending.clear();
+	await stopBotChrome().catch(() => {});
 }
