@@ -1,0 +1,12 @@
+{
+	"manifest_version": 3,
+	"name": "Tek Meet",
+	"version": "0.1.0",
+	"description": "Joins Google Meet on behalf of Tek, captures tab audio for local transcription, and (in participant mode) injects TTS back as a synthetic microphone.",
+	"minimum_chrome_version": "116",
+	"permissions": ["tabCapture", "debugger", "tabs", "scripting", "storage", "offscreen", "alarms", "activeTab"],
+	"host_permissions": ["https://meet.google.com/*", "https://accounts.google.com/*"],
+	"background": { "service_worker": "background.js", "type": "module" },
+	"action": { "default_popup": "popup.html", "default_icon": "icons/48.png" },
+	"icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+}
