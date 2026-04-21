@@ -137,3 +137,51 @@ try {
 } catch (e) {
 	console.warn("[tek-meet content-isolated] MutationObserver setup failed", e);
 }
+
+/**
+ * Plan 104-06: SW → MAIN-world bridge for TTS injection.
+ *
+ * The SW can't send MediaStreamTrack / AudioBuffer objects across worlds; it
+ * relays the raw PCM base64 through this isolated-world script, which then
+ * `window.postMessage`s it to MAIN world where content-main-world.js owns the
+ * AudioContext + MediaStreamAudioDestinationNode that feeds the synthetic
+ * mic stream returned by the patched getUserMedia.
+ *
+ * Also forwards a "synth-track-ready" signal for the synthetic-mic attach
+ * path (unused today — the chunk-relay path is the MVP — but left in place
+ * so plan 104-06 Task 3 / 104-09 can migrate to a direct-track handoff
+ * later without touching content-main-world.js).
+ */
+try {
+	chrome.runtime.onMessage.addListener((msg) => {
+		if (!msg || typeof msg !== "object") return;
+		if (msg.kind === "tts-chunk") {
+			try {
+				window.postMessage(
+					{
+						type: "__TEK_MEET_TTS_CHUNK__",
+						pcmBase64: msg.pcmBase64,
+						sampleRate: msg.sampleRate,
+					},
+					"*",
+				);
+			} catch (e) {
+				console.warn("[tek-meet content-isolated] tts-chunk relay failed", e);
+			}
+			return;
+		}
+		if (msg.kind === "synth-track-ready") {
+			try {
+				window.postMessage(
+					{ type: "__TEK_MEET_SET_SYNTHETIC_MIC__" },
+					"*",
+				);
+			} catch {
+				// ignore
+			}
+			return;
+		}
+	});
+} catch (e) {
+	console.warn("[tek-meet content-isolated] SW bridge setup failed", e);
+}

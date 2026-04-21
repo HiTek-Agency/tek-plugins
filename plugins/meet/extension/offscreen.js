@@ -158,6 +158,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, respond) => {
 		respond({ ok: true });
 		return false;
 	}
+	// Plan 104-06: play-tts entry point. The offscreen doc is the SW's normal
+	// message target, but the actual synthetic-mic Web Audio graph lives in
+	// the page's MAIN world (content-main-world.js) because MediaStreamTrack
+	// handoff across worlds is fragile. We delegate here: set the
+	// self-echo suppression window immediately so whisper tags incoming
+	// frames as self-echo, and signal "done" synchronously so the gateway's
+	// RPC resolves. The actual PCM chunk delivery to MAIN world happens via
+	// the background SW → content-isolated → window.postMessage bridge that
+	// forwards {kind:"tts-chunk", pcmBase64, sampleRate} to the page.
+	if (msg.kind === "play-tts") {
+		try {
+			const sampleRate = typeof msg.sampleRate === "number" ? msg.sampleRate : 24000;
+			const pcmBase64 = typeof msg.pcmBase64 === "string" ? msg.pcmBase64 : "";
+			// Estimate duration so whisper can suppress the self-echo window.
+			const approxBytes = Math.ceil(pcmBase64.length * 0.75);
+			const approxSamples = Math.floor(approxBytes / 2);
+			const durMs = Math.round((approxSamples / sampleRate) * 1000) + 500;
+			suppressUntilMs = Date.now() + durMs;
+			respond({ ok: true, suppressUntilMs, durMs });
+		} catch (e) {
+			respond({ ok: false, error: String(e?.message || e) });
+		}
+		return false;
+	}
 	return undefined;
 });
 

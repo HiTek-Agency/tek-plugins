@@ -135,17 +135,81 @@
 	// track itself may be a real MediaStreamTrack (transferred same-origin
 	// same-tab) or — for the PCM chunk-relay path used by plan 104-06 task 3 —
 	// omitted, with the actual audio fed via __TEK_MEET_TTS_CHUNK__ messages.
+	// The chunk-relay path is the MVP: we build an AudioContext +
+	// MediaStreamAudioDestinationNode lazily on first chunk, use its
+	// .stream.getAudioTracks()[0] as the synthetic mic, and play each
+	// incoming PCM chunk through a BufferSource → destinationNode.
+
+	let ttsAudioCtx = null;
+	let ttsDestNode = null;
+
+	function ensureTtsGraph() {
+		if (ttsAudioCtx && ttsDestNode) return;
+		try {
+			ttsAudioCtx = new AudioContext({ sampleRate: 48000 });
+			ttsDestNode = ttsAudioCtx.createMediaStreamDestination();
+			// The destination node's .stream exposes a single audio track
+			// that behaves like a real mic input. Hand this stream to the
+			// getUserMedia override so Meet gets the bot's voice as if it
+			// were coming from a microphone.
+			const track = ttsDestNode.stream.getAudioTracks()[0];
+			attachSynth(track);
+		} catch (e) {
+			try {
+				console.warn("[tek-meet-main] TTS AudioContext build failed", e);
+			} catch {
+				// ignore
+			}
+		}
+	}
+
+	function playPcmChunk(pcmBase64, sampleRate) {
+		if (!pcmBase64 || typeof pcmBase64 !== "string") return;
+		ensureTtsGraph();
+		if (!ttsAudioCtx || !ttsDestNode) return;
+		try {
+			const rate = typeof sampleRate === "number" ? sampleRate : 24000;
+			// base64 → Uint8Array → Int16Array → Float32Array
+			const bin = atob(pcmBase64);
+			const u8 = new Uint8Array(bin.length);
+			for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+			const pcm = new Int16Array(u8.buffer);
+			const f32 = new Float32Array(pcm.length);
+			for (let i = 0; i < pcm.length; i++) f32[i] = pcm[i] / 32768;
+			const buf = ttsAudioCtx.createBuffer(1, f32.length || 1, rate);
+			if (f32.length > 0) buf.copyToChannel(f32, 0);
+			const src = ttsAudioCtx.createBufferSource();
+			src.buffer = buf;
+			src.connect(ttsDestNode);
+			src.start();
+		} catch (e) {
+			try {
+				console.warn("[tek-meet-main] playPcmChunk failed", e);
+			} catch {
+				// ignore
+			}
+		}
+	}
+
 	if (typeof window.addEventListener === "function") {
 		window.addEventListener("message", (ev) => {
 			const data = ev?.data;
 			if (!data || typeof data !== "object") return;
 			if (data.type === "__TEK_MEET_SET_SYNTHETIC_MIC__") {
+				// Direct-track path (unused by MVP chunk-relay; forward-declared
+				// hook for future plan-104-09 track-handoff upgrade).
 				attachSynth(data.track);
+				return;
 			}
-			// Plan 104-06 task 3 will use __TEK_MEET_TTS_CHUNK__ to stream
-			// PCM chunks into an in-world AudioContext + MediaStreamDestination.
-			// This event is a forward-declared hook — the handler body lives
-			// in task 3's additive edit to this file.
+			if (data.type === "__TEK_MEET_TTS_CHUNK__") {
+				playPcmChunk(data.pcmBase64, data.sampleRate);
+				return;
+			}
 		});
 	}
+
+	// Expose a test/debug hook so UATs and future plans can probe the
+	// synthetic-mic pipeline without orchestrating the full SW → isolated
+	// → main-world relay.
+	window.__TEK_MEET_PLAY_PCM__ = playPcmChunk;
 })();

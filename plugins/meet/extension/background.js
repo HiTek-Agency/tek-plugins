@@ -124,6 +124,51 @@ function connect(meta) {
 				}
 				return;
 			}
+			// Plan 104-06: TTS playback entry point. The gateway sends
+			// {pcmBase64, sampleRate}; we route it into the offscreen doc
+			// (which sets the self-echo suppression window) AND forward it
+			// to the MAIN world via content-isolated → window.postMessage
+			// so the in-world AudioContext can play it through the synthetic
+			// mic's MediaStreamDestinationNode. Two deliveries because
+			// neither the SW nor the offscreen doc can construct the
+			// MediaStream that Meet's getUserMedia override needs — only the
+			// MAIN world can.
+			if (msg.tool === "meet.play-tts") {
+				try {
+					const args = msg.args || {};
+					// 1. Offscreen doc — mark suppression window.
+					try {
+						await chrome.runtime.sendMessage({
+							kind: "play-tts",
+							pcmBase64: args.pcmBase64,
+							sampleRate: args.sampleRate,
+						});
+					} catch (e) {
+						console.warn("[tek-meet] offscreen play-tts ack failed", e);
+					}
+					// 2. Bot tab — relay the chunk to MAIN world via
+					// content-isolated for actual audio playback through
+					// the synthetic mic stream.
+					if (currentMeetingTabId != null) {
+						try {
+							await chrome.tabs.sendMessage(currentMeetingTabId, {
+								kind: "tts-chunk",
+								pcmBase64: args.pcmBase64,
+								sampleRate: args.sampleRate,
+							});
+						} catch (e) {
+							console.warn(
+								"[tek-meet] tts-chunk relay failed",
+								e,
+							);
+						}
+					}
+					sendResult({ value: { ok: true } });
+				} catch (e) {
+					sendResult({ error: String(e?.message || e) });
+				}
+				return;
+			}
 		}
 		await dispatch(msg, (out) => {
 			try {

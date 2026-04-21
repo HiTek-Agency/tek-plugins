@@ -36,6 +36,9 @@ import { finalize as finalizeArchive } from "./archive-writer.js";
 import { writeSummaryMd } from "./summarize.js";
 import { createMeetingDoc } from "./doc-creator.js";
 import { startReconciliation } from "./meet-reconciler.js";
+// Plan 104-06 additions — participant-mode wake-word + FSM.
+import { createWakeWordScanner } from "./wake-word-scanner.js";
+import { createMeetFsm, STATES } from "./meet-fsm.js";
 
 const TOKEN_PATH = join(homedir(), ".config", "tek", "meet.token");
 const META_PATH = join(homedir(), ".config", "tek", "meet.json");
@@ -77,6 +80,12 @@ let _meetTabId = null;
 // Plan 104-05 additions — captured at joinMeet, consumed by onMeetingEnd.
 let _meetUrl = null;
 let _meetingTitle = "";
+// Plan 104-06 additions — participant mode wake-word + FSM state.
+// _scanner and _fsm are created only in participant mode; observer-mode joins
+// leave them null so the emitChunk callback short-circuits without overhead.
+let _scanner = null;
+let _fsm = null;
+let _silenceTimer = null;
 
 /**
  * Default whisper model path — reuses voice-input-stt's model location so
@@ -155,6 +164,24 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	_tracker = createSpeakerTracker();
 
 	const cfg = _currentCtx?.getConfig?.() ?? {};
+	// Plan 104-06: participant-mode wake-word + FSM. Only arm these in
+	// participant mode so observer-mode joins have zero wake-word overhead.
+	// Scanner default phrases "hey tek", "tek join in" per CONTEXT D-08.
+	if (mode === "participant") {
+		const rawPhrases = cfg.wakeWordPhrases;
+		const phrases = Array.isArray(rawPhrases)
+			? rawPhrases
+			: typeof rawPhrases === "string" && rawPhrases.length > 0
+				? rawPhrases.split(",").map((s) => s.trim()).filter(Boolean)
+				: ["hey tek", "tek join in"];
+		_scanner = createWakeWordScanner({ phrases });
+		_fsm = createMeetFsm();
+		_fsm.transition("join");
+		_logger.info?.(
+			`${LOG_PREFIX} participant mode armed — phrases=[${phrases.join(", ")}]`,
+		);
+	}
+
 	const modelPath = resolveWhisperModelPath(cfg.whisperModelPath);
 	try {
 		_transcriber = await createTranscriber({
@@ -168,12 +195,39 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 					_logger.warn?.(`${LOG_PREFIX} raw.jsonl append failed: ${e?.message || e}`);
 				}
 				// Plan 104-05 reads raw.jsonl to build transcript.md.
-				// Plan 104-06 reads it for wake-word scanning.
 				// A future gateway push API (phase 108) will broadcast
 				// meet.transcript.chunk to the desktop status chip.
 				_logger.debug?.(
 					`${LOG_PREFIX} chunk: ${String(chunk.text || "").slice(0, 80)}`,
 				);
+				// Plan 104-06: scan chunks for wake-words ONLY while we're in
+				// the observing state (the FSM ignores chunks in other states
+				// anyway, but gating here is cheaper). Skip self-echo chunks
+				// (plan 104-03 tags these during the bot's own TTS playback).
+				if (
+					_scanner &&
+					_fsm?.currentState() === STATES.OBSERVING &&
+					chunk.source !== "self-echo" &&
+					chunk.transcribe !== false
+				) {
+					const r = _scanner.processChunk({
+						text: chunk.text,
+						t_end_ms: chunk.t_end_ms,
+					});
+					if (r.matched) {
+						_logger.info?.(
+							`${LOG_PREFIX} wake-word '${r.phrase}' detected`,
+						);
+						handleWakeWord({
+							text: chunk.text,
+							matchedPhrase: r.phrase,
+						}).catch((e) =>
+							_logger.warn?.(
+								`${LOG_PREFIX} wake handler: ${e?.message || e}`,
+							),
+						);
+					}
+				}
 			},
 		});
 	} catch (e) {
@@ -271,6 +325,139 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 		tabId: _meetTabId,
 		note: "Chrome spawned + audio pipeline armed + transparency announce attempted.",
 	};
+}
+
+/**
+ * Plan 104-06: handle a wake-word hit. Drives the FSM through the full
+ * participant-mode cycle: observing → wake-detected → thinking → speaking →
+ * observing.
+ *
+ * Each step is guarded:
+ *   - ctx.generateReply / ctx.generateTts are FORWARD references to plan
+ *     104-09. If absent, log a warning and transition back to observing so
+ *     the FSM still flips visibly (chip + logs). Do NOT crash.
+ *   - meet.play-tts RPC runs in the extension's offscreen doc (task 3 also
+ *     wires this handler). If play-tts fails, transition to llm-error →
+ *     observing.
+ *   - A silence timer returns the conversation to "waiting for the next
+ *     wake-word" after a configurable timeout (D-09, default 15s).
+ */
+async function handleWakeWord({ text, matchedPhrase }) {
+	if (!_fsm) return;
+	try {
+		_fsm.transition("wake");
+		// MVP: the current chunk's text IS the utterance. Strip the wake phrase
+		// and use whatever remains (or a brief-answer prompt if nothing does).
+		const utterance =
+			String(text || "")
+				.toLowerCase()
+				.replace(String(matchedPhrase || "").toLowerCase(), "")
+				.trim() || "Please answer briefly.";
+		_fsm.transition("utterance-end");
+
+		// NOTE (per plan 104-09 forward reference): ctx.generateReply and
+		// ctx.generateTts are scheduled helpers on PluginContext. Until then
+		// this optional-chain falls through to a placeholder string — the
+		// wake-word still fires, the FSM still transitions, and the chip/log
+		// observably flip state. Plan 104-09 will supplant these fallbacks.
+		let llmResponse = null;
+		try {
+			llmResponse = await (_currentCtx?.generateReply?.({
+				prompt: utterance,
+				meetingId: _meetingId,
+			}) ?? Promise.resolve(null));
+		} catch (e) {
+			_logger.warn?.(
+				`${LOG_PREFIX} ctx.generateReply threw: ${e?.message || e}`,
+			);
+		}
+		if (!llmResponse?.text) {
+			_logger.warn?.(
+				`${LOG_PREFIX} participant response skipped — ctx.generateReply not available (waits on plan 104-09)`,
+			);
+			// No LLM output — graceful-fail back to observing so the next
+			// wake-word is still detected.
+			try {
+				_fsm.transition("llm-error");
+			} catch {
+				// ignore — FSM may have been reset mid-flight
+			}
+			return;
+		}
+
+		let tts = null;
+		try {
+			tts = await (_currentCtx?.generateTts?.({
+				text: llmResponse.text,
+				sampleRate: 24000,
+			}) ?? Promise.resolve(null));
+		} catch (e) {
+			_logger.warn?.(
+				`${LOG_PREFIX} ctx.generateTts threw: ${e?.message || e}`,
+			);
+		}
+		if (!tts?.pcmBase64) {
+			_logger.warn?.(
+				`${LOG_PREFIX} tts unavailable — ctx.generateTts not available (waits on plan 104-09)`,
+			);
+			try {
+				_fsm.transition("llm-error");
+			} catch {
+				// ignore
+			}
+			return;
+		}
+
+		_fsm.transition("tts-ready");
+
+		// Suppress wake-word + whisper for the TTS duration + 500 ms safety so
+		// we don't self-trigger on echo of our own voice.
+		// pcmBase64.length * 0.75 → approx bytes; /2 → int16 samples; /24000
+		// → seconds. +500 ms safety.
+		const approxBytes = Math.ceil(tts.pcmBase64.length * 0.75);
+		const approxSamples = Math.floor(approxBytes / 2);
+		const durMs = Math.round((approxSamples / 24000) * 1000) + 500;
+		_scanner?.setSuppressUntil(Date.now() + durMs);
+
+		try {
+			await _rpc(
+				"meet.play-tts",
+				{ pcmBase64: tts.pcmBase64, sampleRate: 24000 },
+				60_000,
+			);
+		} catch (e) {
+			_logger.warn?.(`${LOG_PREFIX} meet.play-tts failed: ${e?.message || e}`);
+			try {
+				_fsm.transition("tts-end");
+			} catch {
+				// ignore
+			}
+			return;
+		}
+
+		try {
+			_fsm.transition("tts-end");
+		} catch {
+			// ignore — FSM may have been reset mid-flight
+		}
+
+		// Silence timer: N seconds after speech, log + stay in observing.
+		// CONTEXT D-09 default 15 s, overridable via config.
+		const silenceTimeoutMs = Number(_currentCtx?.getConfig?.()?.silenceTimeoutMs) || 15_000;
+		if (_silenceTimer) clearTimeout(_silenceTimer);
+		_silenceTimer = setTimeout(() => {
+			_logger.info?.(
+				`${LOG_PREFIX} silence timeout; staying in observing for next wake-word`,
+			);
+		}, silenceTimeoutMs);
+	} catch (e) {
+		_logger.warn?.(`${LOG_PREFIX} wake handler error: ${e?.message || e}`);
+		try {
+			_fsm?.transition("llm-error");
+		} catch {
+			// ignore
+		}
+	}
 }
 
 /**
@@ -457,6 +644,19 @@ async function onMeetingEnd({ endedAt = new Date() } = {}) {
 	}
 	_transcriber = null;
 	_tracker?.reset();
+	// Plan 104-06: tear down participant-mode state as well so a future
+	// observer-mode join starts with no wake-word / FSM / timer residue.
+	_scanner = null;
+	try {
+		_fsm?.reset();
+	} catch {
+		// ignore
+	}
+	_fsm = null;
+	if (_silenceTimer) {
+		clearTimeout(_silenceTimer);
+		_silenceTimer = null;
+	}
 }
 
 export async function register(ctx) {
@@ -670,6 +870,19 @@ export async function register(ctx) {
 				// ignore
 			}
 			_tracker = null;
+			// Plan 104-06: drop participant-mode state as well (kick may fire
+			// mid-awake; scanner/FSM/timer must go).
+			_scanner = null;
+			try {
+				_fsm?.reset();
+			} catch {
+				// ignore
+			}
+			_fsm = null;
+			if (_silenceTimer) {
+				clearTimeout(_silenceTimer);
+				_silenceTimer = null;
+			}
 			_meetingId = null;
 			_mode = null;
 			_meetTabId = null;
@@ -765,6 +978,18 @@ export async function register(ctx) {
 			// Plan 104-04: drop tracker state so the next join starts fresh.
 			_tracker?.reset();
 			_tracker = null;
+			// Plan 104-06: drop participant-mode state.
+			_scanner = null;
+			try {
+				_fsm?.reset();
+			} catch {
+				// ignore
+			}
+			_fsm = null;
+			if (_silenceTimer) {
+				clearTimeout(_silenceTimer);
+				_silenceTimer = null;
+			}
 			_meetTabId = null;
 			try {
 				_wss?.close();
@@ -797,6 +1022,18 @@ export async function cleanup() {
 	// Plan 104-04: drop tracker state.
 	_tracker?.reset();
 	_tracker = null;
+	// Plan 104-06: drop participant-mode state.
+	_scanner = null;
+	try {
+		_fsm?.reset();
+	} catch {
+		// ignore
+	}
+	_fsm = null;
+	if (_silenceTimer) {
+		clearTimeout(_silenceTimer);
+		_silenceTimer = null;
+	}
 	_meetTabId = null;
 	try {
 		_wss?.close();
