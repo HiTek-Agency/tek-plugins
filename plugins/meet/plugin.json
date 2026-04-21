@@ -4,7 +4,7 @@
 	"version": "0.1.0",
 	"description": "Agent joins Google Meet as observer or wake-word participant. Local whisper transcription, DOM speaker attribution, post-meeting Google Doc + summary.",
 	"entryPoint": "src/index.js",
-	"permissions": ["tools", "config", "context", "ws-handlers"],
+	"permissions": ["tools", "config", "context", "ws-handlers", "parent-agent"],
 	"configSchema": [
 		{
 			"key": "wsPort",

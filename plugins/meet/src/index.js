@@ -328,19 +328,16 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 }
 
 /**
- * Plan 104-06: handle a wake-word hit. Drives the FSM through the full
- * participant-mode cycle: observing → wake-detected → thinking → speaking →
- * observing.
+ * Plan 104-06 / 104-09: handle a wake-word hit. Drives the FSM through the
+ * full participant-mode cycle: observing → wake-detected → thinking →
+ * speaking → observing.
  *
- * Each step is guarded:
- *   - ctx.generateReply / ctx.generateTts are FORWARD references to plan
- *     104-09. If absent, log a warning and transition back to observing so
- *     the FSM still flips visibly (chip + logs). Do NOT crash.
- *   - meet.play-tts RPC runs in the extension's offscreen doc (task 3 also
- *     wires this handler). If play-tts fails, transition to llm-error →
- *     observing.
- *   - A silence timer returns the conversation to "waiting for the next
- *     wake-word" after a configurable timeout (D-09, default 15s).
+ * Plan 104-09 made ctx.generateReply + ctx.generateTts part of the core
+ * PluginContext contract (gated by "parent-agent" permission — declared in
+ * this plugin's plugin.json). The previous optional-chain with a default
+ * fallback from 104-06 is removed — if the gateway is on an older build
+ * that doesn't yet expose these helpers, the handler logs a clear error
+ * and drops back to `observing` via llm-error. The FSM still flips visibly.
  */
 async function handleWakeWord({ text, matchedPhrase }) {
 	if (!_fsm) return;
@@ -355,17 +352,29 @@ async function handleWakeWord({ text, matchedPhrase }) {
 				.trim() || "Please answer briefly.";
 		_fsm.transition("utterance-end");
 
-		// NOTE (per plan 104-09 forward reference): ctx.generateReply and
-		// ctx.generateTts are scheduled helpers on PluginContext. Until then
-		// this optional-chain falls through to a placeholder string — the
-		// wake-word still fires, the FSM still transitions, and the chip/log
-		// observably flip state. Plan 104-09 will supplant these fallbacks.
+		// Guard against an older gateway that predates plan 104-09 — the plugin
+		// can still load but the helper simply isn't on the context. The meet
+		// plugin requires "parent-agent" permission, which means the sandbox
+		// WILL expose generateReply/generateTts as long as the gateway is at
+		// 104-09 or later.
+		if (typeof _currentCtx?.generateReply !== "function") {
+			_logger.error?.(
+				`${LOG_PREFIX} PluginContext.generateReply not available — gateway must be on phase 104-09 or later`,
+			);
+			try {
+				_fsm.transition("llm-error");
+			} catch {
+				// ignore — FSM may have been reset mid-flight
+			}
+			return;
+		}
+
 		let llmResponse = null;
 		try {
-			llmResponse = await (_currentCtx?.generateReply?.({
+			llmResponse = await _currentCtx.generateReply({
 				prompt: utterance,
-				meetingId: _meetingId,
-			}) ?? Promise.resolve(null));
+				systemContext: `You are attending a Google Meet as a voice assistant. Meeting id: ${_meetingId}. Reply briefly and conversationally. Avoid reading long lists.`,
+			});
 		} catch (e) {
 			_logger.warn?.(
 				`${LOG_PREFIX} ctx.generateReply threw: ${e?.message || e}`,
@@ -373,7 +382,7 @@ async function handleWakeWord({ text, matchedPhrase }) {
 		}
 		if (!llmResponse?.text) {
 			_logger.warn?.(
-				`${LOG_PREFIX} participant response skipped — ctx.generateReply not available (waits on plan 104-09)`,
+				`${LOG_PREFIX} participant response skipped — generateReply returned no text`,
 			);
 			// No LLM output — graceful-fail back to observing so the next
 			// wake-word is still detected.
@@ -385,12 +394,24 @@ async function handleWakeWord({ text, matchedPhrase }) {
 			return;
 		}
 
+		if (typeof _currentCtx?.generateTts !== "function") {
+			_logger.error?.(
+				`${LOG_PREFIX} PluginContext.generateTts not available — gateway must be on phase 104-09 or later`,
+			);
+			try {
+				_fsm.transition("llm-error");
+			} catch {
+				// ignore
+			}
+			return;
+		}
+
 		let tts = null;
 		try {
-			tts = await (_currentCtx?.generateTts?.({
+			tts = await _currentCtx.generateTts({
 				text: llmResponse.text,
 				sampleRate: 24000,
-			}) ?? Promise.resolve(null));
+			});
 		} catch (e) {
 			_logger.warn?.(
 				`${LOG_PREFIX} ctx.generateTts threw: ${e?.message || e}`,
@@ -398,7 +419,7 @@ async function handleWakeWord({ text, matchedPhrase }) {
 		}
 		if (!tts?.pcmBase64) {
 			_logger.warn?.(
-				`${LOG_PREFIX} tts unavailable — ctx.generateTts not available (waits on plan 104-09)`,
+				`${LOG_PREFIX} generateTts returned null — voice-output-tts not installed or failed; reverting to observing`,
 			);
 			try {
 				_fsm.transition("llm-error");
@@ -1046,3 +1067,22 @@ export async function cleanup() {
 	_pending.clear();
 	await stopBotChrome().catch(() => {});
 }
+
+// Plan 104-09: test-only entry point. Lets wake-word-scanner.test.js exercise
+// handleWakeWord with a mocked ctx without spinning up a real Meet / WS / FSM.
+// Not part of the plugin's runtime contract — callers outside tests MUST NOT
+// rely on __test__ staying stable across versions.
+export const __test__ = {
+	handleWakeWord,
+	_getFsm: () => _fsm,
+	_getScanner: () => _scanner,
+	_setCtx: (c) => {
+		_currentCtx = c;
+	},
+	_setFsm: (f) => {
+		_fsm = f;
+	},
+	_setMeetingId: (id) => {
+		_meetingId = id;
+	},
+};

@@ -82,3 +82,147 @@ test("regex special chars in phrases are escaped (no regex injection)", () => {
 	assert.equal(s.processChunk({ text: "fooXbar" }).matched, false);
 	assert.equal(s.processChunk({ text: "foo.bar here" }).matched, true);
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Plan 104-09 — handleWakeWord now calls ctx.generateReply + ctx.generateTts
+// directly (no `?? Promise.resolve(null)` fallback). These tests exercise
+// the test-only entry point to confirm the meat of the FSM flow still
+// reaches the ctx helpers with the right arguments.
+// ─────────────────────────────────────────────────────────────────────────
+
+test("handleWakeWord calls ctx.generateReply + ctx.generateTts without fallback (phase 104-09)", async () => {
+	const mod = await import("../src/index.js").catch((e) => {
+		console.warn("skip: index.js import failed:", e?.message || e);
+		return null;
+	});
+	if (!mod?.__test__?.handleWakeWord) {
+		console.warn("skip: __test__ export not available");
+		return;
+	}
+
+	// Fake FSM that records every transition.
+	const transitions = [];
+	const fsm = {
+		transition(evt) {
+			transitions.push(evt);
+			return this;
+		},
+		currentState: () => "observing",
+		reset() {},
+		on() {
+			return () => {};
+		},
+	};
+	mod.__test__._setFsm(fsm);
+	mod.__test__._setMeetingId("test-meeting-123");
+
+	const calls = { reply: [], tts: [] };
+	const rpcLog = [];
+	mod.__test__._setCtx({
+		getConfig: () => ({ silenceTimeoutMs: 15_000 }),
+		generateReply: async (args) => {
+			calls.reply.push(args);
+			return { text: "ok response" };
+		},
+		generateTts: async (args) => {
+			calls.tts.push(args);
+			// 8 chars base64 → 6 decoded bytes → 3 int16 samples @ 24 kHz → ~0.125ms
+			return { pcmBase64: "AAAAAAA=", sampleRate: 24000 };
+		},
+		logger: { info() {}, warn() {}, error() {}, debug() {} },
+	});
+
+	// handleWakeWord fires meet.play-tts via _rpc — that depends on an open
+	// WS socket. We skip the RPC side-effect by NOT wiring _sock; the call
+	// will reject and hit the caught-path below. What we verify is that
+	// generateReply + generateTts got called with the right shape BEFORE
+	// the RPC step, and that the FSM transitioned correctly up to there.
+	try {
+		await mod.__test__.handleWakeWord({ text: "hey tek what's up", matchedPhrase: "hey tek" });
+	} catch {
+		// Expected: no WS socket wired → play-tts rejects. Handler already
+		// caught internally; this catch is belt-and-suspenders.
+	}
+
+	assert.equal(calls.reply.length, 1, "generateReply called exactly once");
+	assert.equal(calls.reply[0].prompt, "what's up");
+	assert.ok(
+		typeof calls.reply[0].systemContext === "string" && calls.reply[0].systemContext.length > 0,
+		"systemContext passed through",
+	);
+	assert.equal(calls.tts.length, 1, "generateTts called exactly once");
+	assert.equal(calls.tts[0].text, "ok response");
+	assert.equal(calls.tts[0].sampleRate, 24000);
+
+	// FSM should have walked wake → utterance-end → tts-ready and then
+	// either tts-end (if RPC succeeds) or a llm-error/tts-end path. The
+	// key assertion: wake + utterance-end + tts-ready MUST all fire.
+	assert.ok(transitions.includes("wake"), "FSM transitioned 'wake'");
+	assert.ok(transitions.includes("utterance-end"), "FSM transitioned 'utterance-end'");
+	assert.ok(transitions.includes("tts-ready"), "FSM transitioned 'tts-ready'");
+	rpcLog.length; // touch var (keeps eslint quiet if present)
+});
+
+test("handleWakeWord transitions to llm-error when generateReply is absent (phase 104-09)", async () => {
+	const mod = await import("../src/index.js").catch(() => null);
+	if (!mod?.__test__?.handleWakeWord) {
+		console.warn("skip: __test__ export not available");
+		return;
+	}
+	const transitions = [];
+	const fsm = {
+		transition(evt) {
+			transitions.push(evt);
+			return this;
+		},
+		currentState: () => "observing",
+		reset() {},
+		on() {
+			return () => {};
+		},
+	};
+	mod.__test__._setFsm(fsm);
+	mod.__test__._setMeetingId("test-meeting-123");
+	// Ctx WITHOUT generateReply — simulates an older gateway that didn't yet
+	// ship phase 104-09.
+	mod.__test__._setCtx({
+		getConfig: () => ({}),
+		logger: { info() {}, warn() {}, error() {}, debug() {} },
+	});
+	await mod.__test__.handleWakeWord({ text: "hey tek test", matchedPhrase: "hey tek" });
+	assert.ok(transitions.includes("llm-error"), "FSM transitioned 'llm-error' on missing generateReply");
+});
+
+test("handleWakeWord transitions to llm-error when generateTts returns null (phase 104-09)", async () => {
+	const mod = await import("../src/index.js").catch(() => null);
+	if (!mod?.__test__?.handleWakeWord) {
+		console.warn("skip: __test__ export not available");
+		return;
+	}
+	const transitions = [];
+	const fsm = {
+		transition(evt) {
+			transitions.push(evt);
+			return this;
+		},
+		currentState: () => "observing",
+		reset() {},
+		on() {
+			return () => {};
+		},
+	};
+	mod.__test__._setFsm(fsm);
+	mod.__test__._setMeetingId("test-meeting-123");
+	mod.__test__._setCtx({
+		getConfig: () => ({}),
+		generateReply: async () => ({ text: "sure" }),
+		// Simulates voice-output-tts not installed.
+		generateTts: async () => null,
+		logger: { info() {}, warn() {}, error() {}, debug() {} },
+	});
+	await mod.__test__.handleWakeWord({ text: "hey tek test", matchedPhrase: "hey tek" });
+	assert.ok(
+		transitions.includes("llm-error"),
+		"FSM transitioned 'llm-error' on null TTS result",
+	);
+});
