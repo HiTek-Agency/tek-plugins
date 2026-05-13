@@ -268,7 +268,7 @@ export async function register(ctx) {
 	// Plan 05: explicit schemas for find / click / form_input / screenshot / javascript_tool.
 	ctx.addTool("find", {
 		description:
-			"Find elements on a page by CSS selector OR accessibility query (text + optional role). Returns { matches: [{ axNodeId, role, name, boundingBox }] } capped at 50. Prefer query+role for natural-language lookups; use selector for precision.",
+			"Find elements on a page by CSS selector OR accessibility query (text + optional role). Returns { matches: [{ axNodeId, role, name, boundingBox }] } capped at 50. Prefer query+role for natural-language lookups; use selector for precision. Pass `click: true` to auto-click when there is exactly one match — that returns { matches, clicked: { ok, x, y, page? } } and saves a round trip.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -283,6 +283,18 @@ export async function register(ctx) {
 					description:
 						"ARIA role filter used with query (e.g. 'button', 'link', 'textbox')",
 				},
+				click: {
+					type: "boolean",
+					description:
+						"If true and exactly one match is found, click it in the same call. If 0 matches: clicked.ok=false, reason='no-match'. If >1: ambiguous; refine the query first.",
+					default: false,
+				},
+				returnPage: {
+					type: "boolean",
+					description:
+						"When auto-clicking, include the post-click page state in clicked.page (default true).",
+					default: true,
+				},
 			},
 			additionalProperties: false,
 		},
@@ -291,7 +303,7 @@ export async function register(ctx) {
 
 	ctx.addTool("click", {
 		description:
-			"Click an element. Pass either selector OR axNodeId (from chrome__find / chrome__read_page). Returns { ok, reason?, x, y }. Uses trusted CDP Input events so event.isTrusted checks pass.",
+			"Click an element. Pass either selector OR axNodeId (from chrome__find / chrome__read_page). Returns { ok, reason?, x, y, page? }. By default, includes a fresh pruned AX tree of the page after the action (settles ~250ms first) so you don't need a follow-up read_page. Set returnPage:false to skip that snapshot for speed. Uses trusted CDP Input events so event.isTrusted checks pass.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -301,6 +313,17 @@ export async function register(ctx) {
 					type: "number",
 					description: "backendDOMNodeId returned by chrome__find or chrome__read_page",
 				},
+				returnPage: {
+					type: "boolean",
+					description:
+						"Include post-click pruned AX tree in result.page (default true). Set false in tight loops where you already know the next selector.",
+					default: true,
+				},
+				settleMs: {
+					type: "number",
+					description:
+						"Milliseconds to wait after the click before capturing page state (default 250).",
+				},
 			},
 			additionalProperties: false,
 		},
@@ -309,7 +332,7 @@ export async function register(ctx) {
 
 	ctx.addTool("form_input", {
 		description:
-			"Type text into an input. Focuses the element first by clicking (same selector/axNodeId semantics as chrome__click). Returns { ok, reason? }.",
+			"Type text into an input. Focuses the element first by clicking (same selector/axNodeId semantics as chrome__click). Returns { ok, reason?, page? }. By default returns a fresh AX snapshot in result.page after the keystrokes settle, so you don't need a follow-up read_page.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -322,11 +345,113 @@ export async function register(ctx) {
 					description: "If true, select-all + delete before inserting",
 					default: false,
 				},
+				pressEnter: {
+					type: "boolean",
+					description: "If true, press Enter after the text is inserted (useful for search bars / submit-on-enter forms).",
+					default: false,
+				},
+				returnPage: {
+					type: "boolean",
+					description: "Include post-input pruned AX tree in result.page (default true).",
+					default: true,
+				},
+				settleMs: {
+					type: "number",
+					description: "Milliseconds to wait after typing before capturing page state (default 250).",
+				},
 			},
 			required: ["text"],
 			additionalProperties: false,
 		},
 		execute: (args) => _rpc("form_input", args ?? {}),
+	});
+
+	ctx.addTool("form_fill", {
+		description:
+			"Fill multiple form fields in one round trip. Each field is focused via click and typed in sequence. Optionally clicks a submit button after the last field. Returns { ok, results: [{ index, ok, reason? }], submitted?, page? }. Use this for multi-field editors (LinkedIn profile, settings forms) instead of N separate form_input calls.",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: { type: "number" },
+				fields: {
+					type: "array",
+					description: "Ordered list of fields to fill. Each entry needs `text` and either selector or axNodeId.",
+					items: {
+						type: "object",
+						properties: {
+							selector: { type: "string" },
+							axNodeId: { type: "number" },
+							text: { type: "string" },
+							clear: { type: "boolean", default: false },
+							pressEnter: { type: "boolean", default: false },
+						},
+						required: ["text"],
+						additionalProperties: false,
+					},
+					minItems: 1,
+				},
+				submit: {
+					description:
+						"Optional submit click after fields. Pass an object with `selector` or `axNodeId`, or true (which currently requires explicit selector/axNodeId — there is no auto-find).",
+					oneOf: [
+						{ type: "boolean" },
+						{
+							type: "object",
+							properties: {
+								selector: { type: "string" },
+								axNodeId: { type: "number" },
+							},
+							additionalProperties: false,
+						},
+					],
+				},
+				stopOnError: {
+					type: "boolean",
+					description: "If true (default), stop and return on first failed field. If false, continue and report all failures.",
+					default: true,
+				},
+				returnPage: {
+					type: "boolean",
+					description: "Include post-fill pruned AX tree in result.page (default true).",
+					default: true,
+				},
+				settleMs: {
+					type: "number",
+					description: "Milliseconds to wait after each field / before final capture (default 250).",
+				},
+			},
+			required: ["fields"],
+			additionalProperties: false,
+		},
+		// Submit click + N inputs can take a while on slow pages — give 60s headroom.
+		execute: (args) => _rpc("form_fill", args ?? {}, 60_000),
+	});
+
+	ctx.addTool("wait_for", {
+		description:
+			"Wait until an element appears (or vanishes if hidden:true). Polls inside the page via MutationObserver for selector/text mode, or polls the AX tree for query mode. Returns { ok, x?, y?, axNodeId?, role?, name?, vanished?, reason? }. Replaces the read_page-polling pattern after navigations or saves.",
+		parameters: {
+			type: "object",
+			properties: {
+				tabId: { type: "number" },
+				selector: { type: "string", description: "CSS selector to wait for (fastest)" },
+				text: { type: "string", description: "Substring to wait for in document.body innerText" },
+				query: { type: "string", description: "AX-tree accessible-name substring (used with optional role)" },
+				role: { type: "string", description: "AX role filter for query mode" },
+				hidden: {
+					type: "boolean",
+					description: "If true, wait for the element/text to NOT be present (e.g. a 'Saving…' spinner to vanish).",
+					default: false,
+				},
+				timeout: {
+					type: "number",
+					description: "Max wait in ms (default 5000, capped 30000).",
+					default: 5000,
+				},
+			},
+			additionalProperties: false,
+		},
+		execute: (args) => _rpc("wait_for", args ?? {}, 35_000),
 	});
 
 	ctx.addTool("screenshot", {

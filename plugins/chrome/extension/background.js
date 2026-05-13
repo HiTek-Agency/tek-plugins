@@ -135,6 +135,35 @@ if (chrome.debugger?.onEvent) {
 
 /* ---------------- tool helpers ---------------- */
 
+/**
+ * Capture a fresh page snapshot (pruned AX tree + innerText) after a settle delay.
+ * Used by click/form_input/form_fill to return the post-action state in one
+ * round trip — the agent doesn't need to immediately call read_page after every
+ * interaction. Returns the same shape as read_page.
+ */
+async function capturePageDelta(tabId, settleMs = 250, includeText = false) {
+	await new Promise((r) => setTimeout(r, settleMs));
+	const target = { tabId };
+	const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+	const pruned = pruneAxTree(ax?.nodes || []);
+	const out = {
+		axTree: pruned.axTree,
+		truncated: pruned.truncated,
+		totalNodes: pruned.totalNodes,
+	};
+	if (includeText) {
+		const evalRes = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+			expression: "document.body ? document.body.innerText : ''",
+			returnByValue: true,
+		});
+		out.text = String(evalRes?.result?.value ?? "")
+			.replace(/\s+\n/g, "\n")
+			.trim()
+			.slice(0, 50000);
+	}
+	return out;
+}
+
 async function resolveTabId(args) {
 	if (typeof args?.tabId === "number") return args.tabId;
 	const [tab] = await chrome.tabs.query({
@@ -216,6 +245,7 @@ const TOOL_HANDLERS = {
 		const tabId = await resolveTabId(args);
 		await ensureAttached(tabId);
 		const target = { tabId };
+		let matches = [];
 		if (typeof args.selector === "string" && args.selector.length > 0) {
 			const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
 				expression: `(() => {
@@ -232,26 +262,52 @@ const TOOL_HANDLERS = {
 				})()`,
 				returnByValue: true,
 			});
-			return { matches: result?.value ?? [] };
+			matches = result?.value ?? [];
+		} else {
+			// Query mode: walk AX tree for name substring + optional role filter
+			const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+			const q = String(args.query || "").toLowerCase();
+			const roleFilter = args.role;
+			matches = (ax?.nodes || [])
+				.filter((n) => {
+					const nameValue = (n.name?.value || "").toLowerCase();
+					if (roleFilter && n.role?.value !== roleFilter) return false;
+					return q ? nameValue.includes(q) : Boolean(nameValue);
+				})
+				.slice(0, 50)
+				.map((n) => ({
+					axNodeId: n.nodeId,
+					backendDOMNodeId: n.backendDOMNodeId,
+					role: n.role?.value,
+					name: n.name?.value,
+					boundingBox: null,
+				}));
 		}
-		// Query mode: walk AX tree for name substring + optional role filter
-		const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
-		const q = String(args.query || "").toLowerCase();
-		const roleFilter = args.role;
-		const matches = (ax?.nodes || [])
-			.filter((n) => {
-				const nameValue = (n.name?.value || "").toLowerCase();
-				if (roleFilter && n.role?.value !== roleFilter) return false;
-				return q ? nameValue.includes(q) : Boolean(nameValue);
-			})
-			.slice(0, 50)
-			.map((n) => ({
-				axNodeId: n.nodeId,
-				backendDOMNodeId: n.backendDOMNodeId,
-				role: n.role?.value,
-				name: n.name?.value,
-				boundingBox: null,
-			}));
+
+		// Auto-click shortcut: if the agent passed `click: true` and there is
+		// exactly one match, click it in the same round trip and return the
+		// post-action page state. This collapses the find→click pattern.
+		if (args.click === true) {
+			if (matches.length === 0) {
+				return { matches, clicked: { ok: false, reason: "no-match" } };
+			}
+			if (matches.length > 1) {
+				return {
+					matches,
+					clicked: { ok: false, reason: `ambiguous-${matches.length}-matches` },
+				};
+			}
+			const only = matches[0];
+			const clickArgs = { tabId };
+			if (only.axNodeId != null) clickArgs.axNodeId = only.axNodeId;
+			else if (typeof args.selector === "string") clickArgs.selector = args.selector;
+			const clickRes = await TOOL_HANDLERS.click({
+				...clickArgs,
+				returnPage: args.returnPage !== false,
+			});
+			return { matches, clicked: clickRes };
+		}
+
 		return { matches };
 	},
 
@@ -308,7 +364,16 @@ const TOOL_HANDLERS = {
 			button: "left",
 			clickCount: 1,
 		});
-		return { ok: true, x: box.x, y: box.y };
+		const result = { ok: true, x: box.x, y: box.y };
+		if (args.returnPage !== false) {
+			try {
+				result.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+			} catch (e) {
+				// Don't fail the click if AX capture stumbles — just note it.
+				result.pageError = String(e?.message ?? e);
+			}
+		}
+		return result;
 	},
 
 	form_input: async (args = {}) => {
@@ -316,8 +381,8 @@ const TOOL_HANDLERS = {
 		await ensureAttached(tabId);
 		const target = { tabId };
 		if (typeof args.text !== "string") return { ok: false, reason: "text-required" };
-		// Focus element first via click (uses same selector/axNodeId path)
-		const clickRes = await TOOL_HANDLERS.click({ ...args, tabId });
+		// Focus element first via click — skip its page capture; we'll do one at the end.
+		const clickRes = await TOOL_HANDLERS.click({ ...args, tabId, returnPage: false });
 		if (!clickRes.ok) return { ok: false, reason: `focus-failed: ${clickRes.reason}` };
 		if (args.clear) {
 			// Best-effort select-all + delete
@@ -339,7 +404,184 @@ const TOOL_HANDLERS = {
 			}
 		}
 		await chrome.debugger.sendCommand(target, "Input.insertText", { text: args.text });
-		return { ok: true };
+		if (args.pressEnter) {
+			try {
+				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+					type: "keyDown",
+					windowsVirtualKeyCode: 13,
+					key: "Enter",
+				});
+				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+					type: "keyUp",
+					windowsVirtualKeyCode: 13,
+					key: "Enter",
+				});
+			} catch {
+				// best-effort — ignore
+			}
+		}
+		const result = { ok: true };
+		if (args.returnPage !== false) {
+			try {
+				result.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+			} catch (e) {
+				result.pageError = String(e?.message ?? e);
+			}
+		}
+		return result;
+	},
+
+	form_fill: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		if (!Array.isArray(args.fields) || args.fields.length === 0) {
+			return { ok: false, reason: "fields-required" };
+		}
+		const results = [];
+		for (let i = 0; i < args.fields.length; i++) {
+			const f = args.fields[i] || {};
+			const r = await TOOL_HANDLERS.form_input({
+				tabId,
+				selector: f.selector,
+				axNodeId: f.axNodeId,
+				text: f.text,
+				clear: f.clear,
+				pressEnter: f.pressEnter,
+				returnPage: false, // batch capture happens at the end
+			});
+			results.push({ index: i, ok: !!r?.ok, reason: r?.reason });
+			if (!r?.ok && args.stopOnError !== false) {
+				const out = { ok: false, results, failedAt: i, reason: r?.reason };
+				if (args.returnPage !== false) {
+					try {
+						out.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+					} catch {
+						// ignore
+					}
+				}
+				return out;
+			}
+		}
+		// Optionally click a submit button after the last field.
+		let submitted;
+		if (args.submit) {
+			const submitArgs = { tabId, returnPage: false };
+			if (typeof args.submit === "object") {
+				if (args.submit.axNodeId != null) submitArgs.axNodeId = args.submit.axNodeId;
+				if (typeof args.submit.selector === "string") submitArgs.selector = args.submit.selector;
+			}
+			if (submitArgs.axNodeId != null || submitArgs.selector) {
+				submitted = await TOOL_HANDLERS.click(submitArgs);
+			} else {
+				submitted = { ok: false, reason: "submit-needs-axNodeId-or-selector" };
+			}
+		}
+		const out = { ok: true, results };
+		if (submitted) out.submitted = submitted;
+		if (args.returnPage !== false) {
+			try {
+				out.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+			} catch (e) {
+				out.pageError = String(e?.message ?? e);
+			}
+		}
+		return out;
+	},
+
+	wait_for: async (args = {}) => {
+		const tabId = await resolveTabId(args);
+		await ensureAttached(tabId);
+		const target = { tabId };
+		const timeoutMs = Math.min(Math.max(Number(args.timeout) || 5000, 100), 30000);
+		const wantHidden = args.hidden === true;
+
+		// Selector mode: poll inside the page via MutationObserver. Resolves
+		// quickly when the DOM mutates, which is much cheaper than re-fetching
+		// the AX tree on the SW side every poll.
+		if (typeof args.selector === "string" && args.selector.length > 0) {
+			const selectorJson = JSON.stringify(args.selector);
+			const expression = `new Promise((resolve) => {
+				const sel = ${selectorJson};
+				const wantHidden = ${wantHidden};
+				const isVisible = (el) => !!el && el.offsetParent !== null;
+				const check = () => {
+					const el = document.querySelector(sel);
+					if (wantHidden) {
+						if (!el || !isVisible(el)) {
+							resolve({ ok: true, vanished: true });
+							return true;
+						}
+					} else if (isVisible(el)) {
+						const r = el.getBoundingClientRect();
+						resolve({ ok: true, x: r.x + r.width / 2, y: r.y + r.height / 2 });
+						return true;
+					}
+					return false;
+				};
+				if (check()) return;
+				const obs = new MutationObserver(() => { if (check()) obs.disconnect(); });
+				obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
+				setTimeout(() => { obs.disconnect(); resolve({ ok: false, reason: "timeout" }); }, ${timeoutMs});
+			})`;
+			const res = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+				expression,
+				returnByValue: true,
+				awaitPromise: true,
+			});
+			return res?.result?.value ?? { ok: false, reason: "no-result" };
+		}
+
+		// Text mode: poll innerText on a short interval.
+		if (typeof args.text === "string" && args.text.length > 0) {
+			const textJson = JSON.stringify(args.text.toLowerCase());
+			const expression = `new Promise((resolve) => {
+				const needle = ${textJson};
+				const wantHidden = ${wantHidden};
+				const check = () => {
+					const present = (document.body?.innerText || "").toLowerCase().includes(needle);
+					if (wantHidden ? !present : present) {
+						resolve({ ok: true, present });
+						return true;
+					}
+					return false;
+				};
+				if (check()) return;
+				const obs = new MutationObserver(() => { if (check()) obs.disconnect(); });
+				obs.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+				setTimeout(() => { obs.disconnect(); resolve({ ok: false, reason: "timeout" }); }, ${timeoutMs});
+			})`;
+			const res = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+				expression,
+				returnByValue: true,
+				awaitPromise: true,
+			});
+			return res?.result?.value ?? { ok: false, reason: "no-result" };
+		}
+
+		// AX query mode: poll the AX tree on the SW side every 250ms.
+		if (typeof args.query === "string") {
+			const q = args.query.toLowerCase();
+			const roleFilter = args.role;
+			const start = Date.now();
+			while (Date.now() - start < timeoutMs) {
+				const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+				const found = (ax?.nodes || []).find((n) => {
+					const nameValue = (n.name?.value || "").toLowerCase();
+					if (roleFilter && n.role?.value !== roleFilter) return false;
+					return q ? nameValue.includes(q) : Boolean(nameValue);
+				});
+				const present = !!found;
+				if (wantHidden ? !present : present) {
+					return found
+						? { ok: true, axNodeId: found.nodeId, role: found.role?.value, name: found.name?.value }
+						: { ok: true, vanished: true };
+				}
+				await new Promise((r) => setTimeout(r, 250));
+			}
+			return { ok: false, reason: "timeout" };
+		}
+
+		return { ok: false, reason: "selector-text-or-query-required" };
 	},
 
 	screenshot: async (args = {}) => {

@@ -1,8 +1,8 @@
 {
 	"id": "chrome",
 	"name": "Chrome Control",
-	"version": "0.1.0",
-	"description": "Drive your real Chrome browser with AI — tabs, navigation, screenshots, AX-tree reads, clicks, typing, and JS evaluation via a local extension over a loopback WebSocket",
+	"version": "0.2.0",
+	"description": "Drive your real Chrome browser with AI — tabs, navigation, screenshots, AX-tree reads, clicks, typing, multi-field form fills, wait-for, and JS evaluation via a local extension over a loopback WebSocket",
 	"entryPoint": "dist/index.js",
 	"permissions": ["tools", "config", "context", "ws-handlers"],
 	"configSchema": [
@@ -29,6 +29,8 @@
 		"chrome__find",
 		"chrome__click",
 		"chrome__form_input",
+		"chrome__form_fill",
+		"chrome__wait_for",
 		"chrome__screenshot",
 		"chrome__javascript_tool"
 	],
