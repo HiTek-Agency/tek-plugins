@@ -51,9 +51,28 @@ async function runPeekaboo(cli, args, timeout = DEFAULT_TIMEOUT) {
 			return { result: stdout.trim() };
 		}
 	} catch (err) {
+		// peekaboo writes error details as JSON on stdout, even when exit is non-zero
+		// (and execFileAsync throws on any non-zero exit). Prefer parsed stdout JSON
+		// over generic err.message so callers see the real cause (e.g.
+		// PERMISSION_ERROR_SCREEN_RECORDING, rather than "Command failed: peekaboo ...").
+		if (err.stdout) {
+			try {
+				const parsed = JSON.parse(err.stdout);
+				if (parsed && typeof parsed === "object") {
+					return { ...parsed, error: true, exitCode: err.code };
+				}
+			} catch {
+				// fall through to string form
+			}
+		}
 		return {
 			error: true,
-			message: err.stderr || err.message || String(err),
+			exitCode: err.code,
+			message:
+				err.stderr ||
+				(err.stdout ? `peekaboo output: ${String(err.stdout).slice(0, 500)}` : null) ||
+				err.message ||
+				String(err),
 		};
 	}
 }
