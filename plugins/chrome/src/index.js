@@ -9,8 +9,8 @@
  * Plan 05 — screenshot + javascript_tool
  */
 
-import { WebSocketServer } from "ws";
-import { randomBytes } from "node:crypto";
+import { WebSocket, WebSocketServer } from "ws";
+import { randomBytes, randomUUID } from "node:crypto";
 import {
 	existsSync,
 	mkdirSync,
@@ -81,19 +81,26 @@ export function checkConnection(remoteAddress, urlString, expectedToken) {
 // Module-level state for cleanup + RPC tracking
 let _wss = null;
 let _sock = null;
-let _lastHandshakeAt = null; // ms timestamp — updated on every inbound message
+let _lastHandshakeAt = null;
+let _lastMessageAt = null;
+let _client = null;
 const _pending = new Map();
-let _seq = 0;
+
+function rejectPending(reason) {
+	for (const pending of _pending.values()) {
+		pending.reject(new Error(reason));
+	}
+	_pending.clear();
+}
 
 export function _getActiveSocket() {
 	return _sock;
 }
 
 export function _rpc(tool, args, timeoutMs = 30_000) {
-	if (!_sock)
+	if (!_sock || _sock.readyState !== WebSocket.OPEN || !_client)
 		return Promise.reject(new Error("chrome extension not connected"));
-	const id = ++_seq;
-	_sock.send(JSON.stringify({ id, kind: "call", tool, args }));
+	const id = `chrome_${randomUUID()}`;
 	return new Promise((resolve, reject) => {
 		const t = setTimeout(() => {
 			_pending.delete(id);
@@ -108,6 +115,13 @@ export function _rpc(tool, args, timeoutMs = 30_000) {
 				clearTimeout(t);
 				reject(e);
 			},
+		});
+		_sock.send(JSON.stringify({ id, kind: "call", tool, args }), (error) => {
+			if (!error) return;
+			const pending = _pending.get(id);
+			if (!pending) return;
+			_pending.delete(id);
+			pending.reject(error);
 		});
 	});
 }
@@ -148,7 +162,21 @@ export async function register(ctx) {
 	});
 
 	_wss.on("connection", (ws) => {
+		if (_sock && _sock !== ws) {
+			rejectPending("Chrome connection was replaced by a newer extension session");
+			try {
+				_sock.close(4001, "replaced");
+			} catch {
+				// old socket is already gone
+			}
+		}
 		_sock = ws;
+		_client = null;
+		_lastHandshakeAt = null;
+		_lastMessageAt = Date.now();
+		const helloTimer = setTimeout(() => {
+			if (_sock === ws && !_client) ws.close(4002, "hello-timeout");
+		}, 5_000);
 		ws.on("message", (raw) => {
 			let msg;
 			try {
@@ -156,8 +184,18 @@ export async function register(ctx) {
 			} catch {
 				return;
 			}
-			_lastHandshakeAt = Date.now(); // any inbound message counts as "alive"
+			_lastMessageAt = Date.now();
 			if (msg.kind === "hello") {
+				clearTimeout(helloTimer);
+				_lastHandshakeAt = Date.now();
+				_client = {
+					extensionId: msg.extensionId ?? null,
+					version: msg.version ?? null,
+					chromeVersion: msg.chromeVersion ?? null,
+					protocolVersion: msg.protocolVersion ?? 1,
+					capabilities: Array.isArray(msg.capabilities) ? msg.capabilities : [],
+					control: msg.control ?? null,
+				};
 				ctx.logger?.info?.(
 					`chrome-control connected: ext=${msg.extensionId} v${msg.version} chrome=${msg.chromeVersion} caps=[${(msg.capabilities || []).join(",")}]`,
 				);
@@ -170,6 +208,15 @@ export async function register(ctx) {
 				);
 				return;
 			}
+			if (msg.kind === "ping") {
+				ws.send(JSON.stringify({ kind: "pong", at: Date.now() }));
+				return;
+			}
+			if (msg.kind === "control_state" && _client) {
+				_client.control = msg.control ?? null;
+				return;
+			}
+			if (!_client) return;
 			if (msg.kind === "result") {
 				const p = _pending.get(msg.id);
 				if (p) {
@@ -179,10 +226,17 @@ export async function register(ctx) {
 				}
 			}
 		});
+		ws.on("error", (error) => {
+			ctx.logger?.warn?.(`chrome-control socket error: ${error?.message ?? error}`);
+		});
 		ws.on("close", () => {
+			clearTimeout(helloTimer);
 			if (_sock === ws) {
+				rejectPending("Chrome extension disconnected while an action was in progress");
 				_sock = null;
+				_client = null;
 				_lastHandshakeAt = null;
+				_lastMessageAt = null;
 			}
 		});
 	});
@@ -194,13 +248,24 @@ export async function register(ctx) {
 	// Plan 04: tight schemas for the four navigation/read tools.
 	ctx.addTool("tabs_list", {
 		description:
-			"List all open Chrome tabs across all windows. Returns array of { id, url, title, active, windowId }. Useful for finding the right tab before navigating or reading.",
+			"List Chrome tabs the user explicitly granted to Tek. Returns array of { id, url, title, active, windowId, controllable }. Use Chrome's Tek popup to allow or revoke the active tab.",
 		parameters: {
 			type: "object",
 			properties: {},
 			additionalProperties: false,
 		},
 		execute: () => _rpc("tabs_list", {}),
+	});
+
+	ctx.addTool("control_status", {
+		description:
+			"Read the user-owned Chrome control lease. Returns { paused, grantedTabCount, activeTabGranted } without exposing ungranted tab metadata. This contract is model/provider neutral.",
+		parameters: {
+			type: "object",
+			properties: {},
+			additionalProperties: false,
+		},
+		execute: () => _rpc("control_status", {}),
 	});
 
 	ctx.addTool("tabs_create", {
@@ -251,7 +316,7 @@ export async function register(ctx) {
 
 	ctx.addTool("read_page", {
 		description:
-			"Read a tab's visible text and pruned accessibility tree. Returns { text, axTree, truncated, totalNodes }. axTree nodes have axNodeId usable with chrome__find / chrome__click. text is innerText (max 50 KB).",
+			"Read a granted tab's visible text and pruned accessibility tree. Returns { text, axTree, truncated, totalNodes }. Nodes include axNodeId plus backendDOMNodeId; prefer backendDOMNodeId for click/input. text is innerText (max 50 KB).",
 		parameters: {
 			type: "object",
 			properties: {
@@ -303,15 +368,19 @@ export async function register(ctx) {
 
 	ctx.addTool("click", {
 		description:
-			"Click an element. Pass either selector OR axNodeId (from chrome__find / chrome__read_page). Returns { ok, reason?, x, y, page? }. By default, includes a fresh pruned AX tree of the page after the action (settles ~250ms first) so you don't need a follow-up read_page. Set returnPage:false to skip that snapshot for speed. Uses trusted CDP Input events so event.isTrusted checks pass.",
+			"Click an element in a user-granted tab. Pass selector, backendDOMNodeId (preferred), or axNodeId from chrome__find/read_page. Returns { ok, reason?, x, y, page? }. By default it includes a fresh pruned AX tree after the action. Uses trusted, tab-targeted CDP Input events and does not move the Mac's pointer.",
 		parameters: {
 			type: "object",
 			properties: {
 				tabId: { type: "number", description: "Target tab. Defaults to active tab." },
 				selector: { type: "string" },
 				axNodeId: {
+					oneOf: [{ type: "number" }, { type: "string" }],
+					description: "Accessibility node id returned by chrome__find or chrome__read_page",
+				},
+				backendDOMNodeId: {
 					type: "number",
-					description: "backendDOMNodeId returned by chrome__find or chrome__read_page",
+					description: "DOM backend node id returned by chrome__find or chrome__read_page (preferred)",
 				},
 				returnPage: {
 					type: "boolean",
@@ -338,7 +407,8 @@ export async function register(ctx) {
 			properties: {
 				tabId: { type: "number" },
 				selector: { type: "string" },
-				axNodeId: { type: "number" },
+				axNodeId: { oneOf: [{ type: "number" }, { type: "string" }] },
+				backendDOMNodeId: { type: "number" },
 				text: { type: "string", description: "Text to insert" },
 				clear: {
 					type: "boolean",
@@ -380,7 +450,8 @@ export async function register(ctx) {
 						type: "object",
 						properties: {
 							selector: { type: "string" },
-							axNodeId: { type: "number" },
+							axNodeId: { oneOf: [{ type: "number" }, { type: "string" }] },
+							backendDOMNodeId: { type: "number" },
 							text: { type: "string" },
 							clear: { type: "boolean", default: false },
 							pressEnter: { type: "boolean", default: false },
@@ -399,7 +470,8 @@ export async function register(ctx) {
 							type: "object",
 							properties: {
 								selector: { type: "string" },
-								axNodeId: { type: "number" },
+								axNodeId: { oneOf: [{ type: "number" }, { type: "string" }] },
+								backendDOMNodeId: { type: "number" },
 							},
 							additionalProperties: false,
 						},
@@ -537,7 +609,9 @@ export async function register(ctx) {
 			requestId: m.id,
 			connected: _sock !== null && _lastHandshakeAt !== null,
 			lastHandshakeAt: _lastHandshakeAt,
+			lastMessageAt: _lastMessageAt,
 			port,
+			client: _client,
 		};
 	};
 	if (typeof ctx.addWsHandler === "function") {
@@ -554,6 +628,14 @@ export async function register(ctx) {
 }
 
 export async function cleanup() {
+	rejectPending("Chrome control plugin is shutting down");
+	if (_sock) {
+		try {
+			_sock.close(1001, "plugin-shutdown");
+		} catch {
+			// socket is already gone
+		}
+	}
 	if (_wss) {
 		try {
 			_wss.close();
@@ -563,6 +645,7 @@ export async function cleanup() {
 		_wss = null;
 	}
 	_sock = null;
+	_client = null;
 	_lastHandshakeAt = null;
-	_pending.clear();
+	_lastMessageAt = null;
 }

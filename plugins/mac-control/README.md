@@ -1,6 +1,6 @@
 # Mac Control Plugin
 
-Control your Mac with AI — screenshots, UI element interaction, typing, window management.
+Control your Mac through any Tek-supported model or agent runtime — screenshots, UI element interaction, typing, app launch/focus, and window management.
 
 Powered by [Peekaboo](https://github.com/steipete/peekaboo).
 
@@ -20,6 +20,7 @@ Grant permissions in System Settings:
 
 | Tool | Description |
 |------|-------------|
+| `mac__control_status` | Read the shared host-control lease and Peekaboo availability |
 | `mac__see` | Capture screen + discover UI elements with IDs (see-then-act) |
 | `mac__click` | Click by element ID, text label, or coordinates |
 | `mac__type` | Type text into focused element |
@@ -37,4 +38,4 @@ Grant permissions in System Settings:
 
 ## Security
 
-This plugin is **disabled by default**. Enable it in Tek Settings > Plugins after granting macOS permissions.
+This plugin is **disabled by default**. Enable it in Tek Settings > Plugins after granting macOS permissions. Current Gateways enforce the shared **Take Over / Resume agents** lease around every tool, so the local browser and Mac app automation have one boundary regardless of which model or subscription is active.

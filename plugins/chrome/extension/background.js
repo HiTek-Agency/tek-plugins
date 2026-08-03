@@ -13,8 +13,54 @@
  */
 
 import { pruneAxTree } from "./ax-prune.js";
+import {
+	grantTab,
+	isTabAllowed,
+	normalizeControlPolicy,
+	revokeTab,
+	setControlPaused,
+} from "./control-policy.js";
 
 const OFFSCREEN_URL = "offscreen.html";
+const CONTROL_POLICY_KEY = "controlPolicy";
+
+async function loadControlPolicy() {
+	const stored = await chrome.storage.local.get([CONTROL_POLICY_KEY]);
+	return normalizeControlPolicy(stored?.[CONTROL_POLICY_KEY]);
+}
+
+async function saveControlPolicy(policy) {
+	const next = normalizeControlPolicy(policy);
+	await chrome.storage.local.set({ [CONTROL_POLICY_KEY]: next });
+	try {
+		chrome.runtime.sendMessage({ kind: "control-state-changed", control: next }).catch(() => {});
+	} catch {
+		// Offscreen/popup contexts may not be awake yet.
+	}
+	return next;
+}
+
+async function activeTab() {
+	const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+	return tab ?? null;
+}
+
+async function controlStatus() {
+	const [policy, tab] = await Promise.all([loadControlPolicy(), activeTab()]);
+	return {
+		paused: policy.paused,
+		grantedTabCount: policy.allowedTabIds.length,
+		allowedTabIds: policy.allowedTabIds,
+		activeTab: tab
+			? {
+					id: tab.id,
+					title: tab.title ?? "",
+					url: tab.url ?? "",
+					allowed: isTabAllowed(policy, tab.id),
+				}
+			: null,
+	};
+}
 
 async function hasOffscreenDoc() {
 	if (typeof chrome.offscreen?.hasDocument === "function") {
@@ -54,6 +100,11 @@ async function ensureOffscreen() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
+	chrome.storage.local.get([CONTROL_POLICY_KEY]).then((stored) => {
+		if (stored?.[CONTROL_POLICY_KEY] === undefined) {
+			return saveControlPolicy(normalizeControlPolicy(null));
+		}
+	});
 	ensureOffscreen();
 	chrome.alarms.create("keepalive", { periodInMinutes: 0.5 });
 });
@@ -81,6 +132,16 @@ async function ensureAttached(tabId) {
 	await chrome.debugger.sendCommand(target, "DOM.enable");
 	await chrome.debugger.sendCommand(target, "Runtime.enable");
 	await chrome.debugger.sendCommand(target, "Accessibility.enable");
+	try {
+		await chrome.debugger.sendCommand(target, "Target.setAutoAttach", {
+			autoAttach: true,
+			waitForDebuggerOnStart: false,
+			flatten: true,
+			filter: [{ type: "iframe", exclude: false }],
+		});
+	} catch (error) {
+		console.warn("[tek] cross-origin frame auto-attach unavailable:", error);
+	}
 	// Input domain is required for dispatchMouseEvent / insertText / dispatchKeyEvent
 	try {
 		await chrome.debugger.sendCommand(target, "Input.enable");
@@ -96,6 +157,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 		attached.delete(tabId);
 	}
 	mainWorldContexts.delete(tabId);
+	void loadControlPolicy().then((policy) => {
+		if (isTabAllowed(policy, tabId)) return saveControlPolicy(revokeTab(policy, tabId));
+	});
 });
 
 if (chrome.debugger?.onDetach) {
@@ -116,10 +180,31 @@ if (chrome.debugger?.onDetach) {
  */
 const mainWorldContexts = new Map(); // tabId -> contextId (number)
 
+async function detachAllDebugSessions() {
+	await Promise.allSettled(
+		[...attached.keys()].map((tabId) => chrome.debugger.detach({ tabId })),
+	);
+	attached.clear();
+	mainWorldContexts.clear();
+}
+
 if (chrome.debugger?.onEvent) {
 	chrome.debugger.onEvent.addListener((source, method, params) => {
 		if (!source?.tabId) return;
-		if (method === "Runtime.executionContextCreated") {
+		if (method === "Target.attachedToTarget" && params?.sessionId) {
+			const child = { tabId: source.tabId, sessionId: params.sessionId };
+			void Promise.allSettled([
+				chrome.debugger.sendCommand(child, "Runtime.enable"),
+				chrome.debugger.sendCommand(child, "DOM.enable"),
+				chrome.debugger.sendCommand(child, "Accessibility.enable"),
+				chrome.debugger.sendCommand(child, "Target.setAutoAttach", {
+					autoAttach: true,
+					waitForDebuggerOnStart: false,
+					flatten: true,
+					filter: [{ type: "iframe", exclude: false }],
+				}),
+			]);
+		} else if (method === "Runtime.executionContextCreated") {
 			if (params?.context?.auxData?.isDefault === true) {
 				mainWorldContexts.set(source.tabId, params.context.id);
 			}
@@ -174,6 +259,25 @@ async function resolveTabId(args) {
 	return tab.id;
 }
 
+async function dispatchToolCall(tool, args = {}) {
+	if (tool === "control_status") return TOOL_HANDLERS.control_status(args);
+	if (tool === "tabs_list") return TOOL_HANDLERS.tabs_list(args);
+
+	const policy = await loadControlPolicy();
+	if (policy.paused) {
+		throw new Error("Chrome control is paused by the user. Ask them to resume it in the Tek extension.");
+	}
+	if (tool === "tabs_create") return TOOL_HANDLERS.tabs_create(args);
+
+	const tabId = await resolveTabId(args);
+	if (!isTabAllowed(policy, tabId)) {
+		throw new Error(
+			`Chrome tab ${tabId} is not granted to Tek. The user must allow this tab in the Tek extension.`,
+		);
+	}
+	return TOOL_HANDLERS[tool]({ ...args, tabId });
+}
+
 async function waitForLoad(tabId, timeoutMs = 30000) {
 	return new Promise((resolve, reject) => {
 		const timer = setTimeout(() => {
@@ -191,22 +295,49 @@ async function waitForLoad(tabId, timeoutMs = 30000) {
 	});
 }
 
+async function resolveBackendDOMNodeId(target, args) {
+	if (Number.isInteger(args.backendDOMNodeId)) return args.backendDOMNodeId;
+	if (args.axNodeId == null) return null;
+
+	const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+	const node = (ax?.nodes || []).find((candidate) => String(candidate.nodeId) === String(args.axNodeId));
+	if (Number.isInteger(node?.backendDOMNodeId)) return node.backendDOMNodeId;
+
+	// Backward compatibility: early Tek builds mislabeled backendDOMNodeId as
+	// axNodeId in the public tool schema. Preserve those recorded calls.
+	if (Number.isInteger(args.axNodeId)) return args.axNodeId;
+	return null;
+}
+
 /* ---------------- tool handlers ---------------- */
 
 const TOOL_HANDLERS = {
+	control_status: async () => {
+		const status = await controlStatus();
+		return {
+			paused: status.paused,
+			grantedTabCount: status.grantedTabCount,
+			activeTabGranted: status.activeTab?.allowed === true,
+		};
+	},
 	tabs_list: async () => {
+		const policy = await loadControlPolicy();
 		const tabs = await chrome.tabs.query({});
-		return tabs.map((t) => ({
-			id: t.id,
-			url: t.url,
-			title: t.title,
-			active: t.active,
-			windowId: t.windowId,
-		}));
+		return tabs
+			.filter((t) => isTabAllowed(policy, t.id))
+			.map((t) => ({
+				id: t.id,
+				url: t.url,
+				title: t.title,
+				active: t.active,
+				windowId: t.windowId,
+				controllable: !policy.paused,
+			}));
 	},
 	tabs_create: async ({ url, active = true } = {}) => {
 		if (typeof url !== "string") throw new Error("url required");
 		const tab = await chrome.tabs.create({ url, active });
+		await saveControlPolicy(grantTab(await loadControlPolicy(), tab.id));
 		return { id: tab.id, url: tab.url, windowId: tab.windowId };
 	},
 	navigate: async (args = {}) => {
@@ -299,7 +430,8 @@ const TOOL_HANDLERS = {
 			}
 			const only = matches[0];
 			const clickArgs = { tabId };
-			if (only.axNodeId != null) clickArgs.axNodeId = only.axNodeId;
+			if (only.backendDOMNodeId != null) clickArgs.backendDOMNodeId = only.backendDOMNodeId;
+			else if (only.axNodeId != null) clickArgs.axNodeId = only.axNodeId;
 			else if (typeof args.selector === "string") clickArgs.selector = args.selector;
 			const clickRes = await TOOL_HANDLERS.click({
 				...clickArgs,
@@ -316,10 +448,14 @@ const TOOL_HANDLERS = {
 		await ensureAttached(tabId);
 		const target = { tabId };
 		let box;
-		if (args.axNodeId != null) {
+		if (args.axNodeId != null || args.backendDOMNodeId != null) {
 			try {
+				const backendNodeId = await resolveBackendDOMNodeId(target, args);
+				if (!Number.isInteger(backendNodeId)) {
+					return { ok: false, reason: "accessibility-node-has-no-dom-target" };
+				}
 				const { object } = await chrome.debugger.sendCommand(target, "DOM.resolveNode", {
-					backendNodeId: args.axNodeId,
+					backendNodeId,
 				});
 				const { model } = await chrome.debugger.sendCommand(target, "DOM.getBoxModel", {
 					objectId: object.objectId,
@@ -327,7 +463,7 @@ const TOOL_HANDLERS = {
 				const c = model.content;
 				box = { x: (c[0] + c[4]) / 2, y: (c[1] + c[5]) / 2 };
 			} catch (e) {
-				return { ok: false, reason: `axNodeId-resolve-failed: ${e?.message ?? e}` };
+				return { ok: false, reason: `accessibility-node-resolve-failed: ${e?.message ?? e}` };
 			}
 		} else if (typeof args.selector === "string") {
 			const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
@@ -343,7 +479,7 @@ const TOOL_HANDLERS = {
 			if (!result?.value) return { ok: false, reason: "selector-not-found" };
 			box = result.value;
 		} else {
-			return { ok: false, reason: "selector-or-axNodeId-required" };
+			return { ok: false, reason: "selector-or-accessibility-node-required" };
 		}
 		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
 			type: "mouseMoved",
@@ -444,6 +580,7 @@ const TOOL_HANDLERS = {
 				tabId,
 				selector: f.selector,
 				axNodeId: f.axNodeId,
+				backendDOMNodeId: f.backendDOMNodeId,
 				text: f.text,
 				clear: f.clear,
 				pressEnter: f.pressEnter,
@@ -468,12 +605,15 @@ const TOOL_HANDLERS = {
 			const submitArgs = { tabId, returnPage: false };
 			if (typeof args.submit === "object") {
 				if (args.submit.axNodeId != null) submitArgs.axNodeId = args.submit.axNodeId;
+				if (args.submit.backendDOMNodeId != null) {
+					submitArgs.backendDOMNodeId = args.submit.backendDOMNodeId;
+				}
 				if (typeof args.submit.selector === "string") submitArgs.selector = args.submit.selector;
 			}
-			if (submitArgs.axNodeId != null || submitArgs.selector) {
+			if (submitArgs.axNodeId != null || submitArgs.backendDOMNodeId != null || submitArgs.selector) {
 				submitted = await TOOL_HANDLERS.click(submitArgs);
 			} else {
-				submitted = { ok: false, reason: "submit-needs-axNodeId-or-selector" };
+				submitted = { ok: false, reason: "submit-needs-node-or-selector" };
 			}
 		}
 		const out = { ok: true, results };
@@ -573,7 +713,13 @@ const TOOL_HANDLERS = {
 				const present = !!found;
 				if (wantHidden ? !present : present) {
 					return found
-						? { ok: true, axNodeId: found.nodeId, role: found.role?.value, name: found.name?.value }
+						? {
+								ok: true,
+								axNodeId: found.nodeId,
+								backendDOMNodeId: found.backendDOMNodeId,
+								role: found.role?.value,
+								name: found.name?.value,
+							}
 						: { ok: true, vanished: true };
 				}
 				await new Promise((r) => setTimeout(r, 250));
@@ -669,6 +815,53 @@ const TOOL_HANDLERS = {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
 
+	if (msg.kind === "get-control-status") {
+		controlStatus()
+			.then((status) => sendResponse({ ok: true, ...status }))
+			.catch((error) => sendResponse({ ok: false, error: String(error?.message ?? error) }));
+		return true;
+	}
+	if (msg.kind === "grant-active-tab") {
+		Promise.all([loadControlPolicy(), activeTab()])
+			.then(async ([policy, tab]) => {
+				if (!tab?.id) throw new Error("No active Chrome tab");
+				if (/^(chrome|chrome-extension|devtools):/i.test(tab.url ?? "")) {
+					throw new Error("Chrome internal pages cannot be controlled");
+				}
+				await saveControlPolicy(grantTab(policy, tab.id));
+				return controlStatus();
+			})
+			.then((status) => sendResponse({ ok: true, ...status }))
+			.catch((error) => sendResponse({ ok: false, error: String(error?.message ?? error) }));
+		return true;
+	}
+	if (msg.kind === "revoke-active-tab") {
+		Promise.all([loadControlPolicy(), activeTab()])
+			.then(async ([policy, tab]) => {
+				if (!tab?.id) throw new Error("No active Chrome tab");
+				if (attached.has(tab.id)) {
+					await chrome.debugger.detach({ tabId: tab.id }).catch(() => {});
+					attached.delete(tab.id);
+				}
+				await saveControlPolicy(revokeTab(policy, tab.id));
+				return controlStatus();
+			})
+			.then((status) => sendResponse({ ok: true, ...status }))
+			.catch((error) => sendResponse({ ok: false, error: String(error?.message ?? error) }));
+		return true;
+	}
+	if (msg.kind === "set-control-paused" && typeof msg.paused === "boolean") {
+		loadControlPolicy()
+			.then(async (policy) => {
+				if (msg.paused) await detachAllDebugSessions();
+				await saveControlPolicy(setControlPaused(policy, msg.paused));
+				return controlStatus();
+			})
+			.then((status) => sendResponse({ ok: true, ...status }))
+			.catch((error) => sendResponse({ ok: false, error: String(error?.message ?? error) }));
+		return true;
+	}
+
 	// Storage bridge — offscreen docs (reason: WORKERS) can't use chrome.storage,
 	// so the SW owns auth persistence. Also serves popup set-token/reset/get-auth.
 	if (msg.kind === "get-auth") {
@@ -711,8 +904,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		return true;
 	}
 	if (msg.kind === "reset-auth") {
-		chrome.storage.local
-			.remove(["auth", "wsPort"])
+		Promise.all([chrome.storage.local.remove(["auth", "wsPort"]), loadControlPolicy()])
+			.then(async ([, policy]) => {
+				await detachAllDebugSessions();
+				return saveControlPolicy(setControlPaused(policy, true));
+			})
 			.then(() => {
 				try {
 					chrome.runtime.sendMessage({ kind: "auth-updated" }).catch(() => {});
@@ -733,7 +929,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		});
 		return false;
 	}
-	Promise.resolve(handler(msg.args || {}))
+	Promise.resolve(dispatchToolCall(msg.tool, msg.args || {}))
 		.then((result) => sendResponse({ id: msg.id, kind: "result", result }))
 		.catch((err) =>
 			sendResponse({

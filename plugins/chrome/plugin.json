@@ -1,8 +1,8 @@
 {
 	"id": "chrome",
 	"name": "Chrome Control",
-	"version": "0.2.0",
-	"description": "Drive your real Chrome browser with AI — tabs, navigation, screenshots, AX-tree reads, clicks, typing, multi-field form fills, wait-for, and JS evaluation via a local extension over a loopback WebSocket",
+	"version": "0.3.0",
+	"description": "Drive user-granted Chrome tabs through a model-agnostic local bridge with explicit pause, takeover, navigation, page reads, clicks, forms, screenshots, waits, and JavaScript",
 	"entryPoint": "dist/index.js",
 	"permissions": ["tools", "config", "context", "ws-handlers"],
 	"configSchema": [
@@ -22,6 +22,7 @@
 		}
 	],
 	"providesTools": [
+		"chrome__control_status",
 		"chrome__tabs_list",
 		"chrome__tabs_create",
 		"chrome__navigate",

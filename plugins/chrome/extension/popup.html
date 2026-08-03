@@ -16,9 +16,33 @@
 		</section>
 
 		<section class="versions-row">
-			<span>Extension v0.1.0</span>
+			<span>Extension v0.3.0</span>
 			<span class="sep">·</span>
 			<span>Gateway: <span id="gateway-version">—</span></span>
+		</section>
+
+		<section class="control-section" aria-labelledby="control-heading">
+			<div class="control-heading-row">
+				<div>
+					<h2 id="control-heading">Agent control</h2>
+					<p id="control-summary">Paused · no tabs granted</p>
+				</div>
+				<span id="control-badge" class="control-badge paused">Paused</span>
+			</div>
+
+			<div class="active-tab">
+				<span class="eyebrow">Active tab</span>
+				<strong id="active-tab-title">Loading…</strong>
+				<span id="active-tab-url" class="active-tab-url"></span>
+			</div>
+
+			<div class="control-actions">
+				<button id="grant-tab" type="button">Allow this tab</button>
+				<button id="revoke-tab" type="button" class="secondary">Revoke tab</button>
+			</div>
+
+			<button id="toggle-control" type="button" class="takeover">Resume agents</button>
+			<p class="control-note">Only granted tabs are visible to agents. Take over pauses every model immediately.</p>
 		</section>
 
 		<section id="token-section" class="token-section">

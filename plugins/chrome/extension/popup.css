@@ -7,6 +7,7 @@
 	--ok: #10b981;
 	--warn: #f59e0b;
 	--err: #ef4444;
+	--violet: #8b5cf6;
 }
 
 * {
@@ -22,7 +23,7 @@ body {
 	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 	font-size: 13px;
 	line-height: 1.4;
-	min-width: 320px;
+	min-width: 340px;
 }
 
 body {
@@ -121,6 +122,115 @@ header h1 {
 .token-section input:focus {
 	outline: none;
 	border-color: var(--accent);
+}
+
+.control-section {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 12px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	background: rgba(255, 255, 255, 0.025);
+}
+
+.control-heading-row {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.control-heading-row h2 {
+	margin: 0;
+	font-size: 13px;
+	font-weight: 600;
+}
+
+.control-heading-row p {
+	margin: 2px 0 0;
+	font-size: 11px;
+	color: var(--muted);
+}
+
+.control-badge {
+	padding: 3px 7px;
+	border: 1px solid currentColor;
+	border-radius: 999px;
+	font-size: 10px;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.control-badge.paused {
+	color: var(--warn);
+}
+
+.control-badge.active {
+	color: var(--ok);
+}
+
+.active-tab {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 2px;
+	padding: 8px 9px;
+	border: 1px solid var(--border);
+	border-radius: 5px;
+	background: #020617;
+}
+
+.active-tab .eyebrow {
+	font-size: 9px;
+	font-weight: 600;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+	color: var(--muted);
+}
+
+.active-tab strong,
+.active-tab-url {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.active-tab strong {
+	font-size: 12px;
+}
+
+.active-tab-url {
+	font-size: 10px;
+	color: var(--muted);
+}
+
+.control-actions {
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	gap: 7px;
+}
+
+.control-section > button {
+	width: 100%;
+}
+
+button.takeover {
+	border-color: var(--warn);
+	background: rgba(245, 158, 11, 0.12);
+	color: #fbbf24;
+}
+
+button.resume {
+	border-color: var(--violet);
+	background: var(--violet);
+}
+
+.control-note {
+	margin: 0;
+	font-size: 10px;
+	line-height: 1.35;
+	color: var(--muted);
 }
 
 button {

@@ -13,9 +13,11 @@
 const DEFAULT_PORT = 52871;
 const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
+const HEARTBEAT_MS = 15_000;
+const STALE_CONNECTION_MS = 45_000;
 // Offscreen WORKERS context doesn't expose chrome.runtime.getManifest.
 // Keep in sync with manifest.json "version".
-const EXT_VERSION = "0.2.0";
+const EXT_VERSION = "0.3.0";
 
 /** @type {WebSocket | null} */
 let ws = null;
@@ -27,6 +29,9 @@ let serverTime = null;
 let attempt = 0;
 /** @type {ReturnType<typeof setTimeout> | null} */
 let reconnectTimer = null;
+let heartbeatTimer = null;
+let lastServerMessageAt = 0;
+let controlState = { paused: true, grantedTabCount: 0 };
 
 function currentStatus() {
 	return {
@@ -35,7 +40,25 @@ function currentStatus() {
 		reason,
 		gatewayVersion,
 		serverTime,
+		control: controlState,
 	};
+}
+
+function stopHeartbeat() {
+	if (heartbeatTimer) clearInterval(heartbeatTimer);
+	heartbeatTimer = null;
+}
+
+function startHeartbeat() {
+	stopHeartbeat();
+	heartbeatTimer = setInterval(() => {
+		if (!ws || ws.readyState !== WebSocket.OPEN) return;
+		if (lastServerMessageAt && Date.now() - lastServerMessageAt > STALE_CONNECTION_MS) {
+			ws.close(4003, "stale");
+			return;
+		}
+		ws.send(JSON.stringify({ kind: "ping", at: Date.now() }));
+	}, HEARTBEAT_MS);
 }
 
 function broadcastStatus() {
@@ -104,8 +127,10 @@ async function connect() {
 	const url = `ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`;
 	setState("connecting", "connecting");
 
+	let socket;
 	try {
-		ws = new WebSocket(url);
+		socket = new WebSocket(url);
+		ws = socket;
 	} catch (err) {
 		console.warn("[tek] WS construct failed", err);
 		setState("disconnected", "connect-error");
@@ -113,7 +138,8 @@ async function connect() {
 		return;
 	}
 
-	ws.onopen = () => {
+	socket.onopen = async () => {
+		if (ws !== socket) return;
 		console.log("[tek] WS open", url);
 		let extensionId = null;
 		try {
@@ -123,20 +149,35 @@ async function connect() {
 		}
 		const hello = {
 			kind: "hello",
+			protocolVersion: 1,
 			version: EXT_VERSION,
 			chromeVersion: getChromeVersion(),
 			extensionId,
-			capabilities: ["tabs", "debugger", "scripting", "screenshot"],
+			capabilities: ["tabs", "debugger", "scripting", "screenshot", "control-lease"],
 		};
 		try {
-			ws.send(JSON.stringify(hello));
+			const status = await chrome.runtime.sendMessage({ kind: "get-control-status" });
+			if (status?.ok) {
+				controlState = {
+					paused: status.paused === true,
+					grantedTabCount: Number(status.grantedTabCount) || 0,
+				};
+				hello.control = controlState;
+			}
+		} catch {
+			// The service worker will publish the state after it wakes.
+		}
+		try {
+			socket.send(JSON.stringify(hello));
 			console.log("[tek] hello sent", hello);
 		} catch (err) {
 			console.warn("[tek] hello send failed", err);
 		}
 	};
 
-	ws.onmessage = async (event) => {
+	socket.onmessage = async (event) => {
+		if (ws !== socket) return;
+		lastServerMessageAt = Date.now();
 		let msg;
 		try {
 			msg = JSON.parse(event.data);
@@ -148,8 +189,10 @@ async function connect() {
 			serverTime = msg.serverTime ?? null;
 			attempt = 0; // reset backoff on successful handshake
 			setState("connected", "open");
+			startHeartbeat();
 			return;
 		}
+		if (msg.kind === "pong") return;
 		if (msg.kind === "call") {
 			// Forward RPC call to SW for dispatch (plan 04/05 fill bodies)
 			try {
@@ -159,12 +202,12 @@ async function connect() {
 					tool: msg.tool,
 					args: msg.args,
 				});
-				if (ws && ws.readyState === WebSocket.OPEN) {
-					ws.send(JSON.stringify(result ?? { id: msg.id, kind: "result", error: "no-sw-response" }));
+				if (socket.readyState === WebSocket.OPEN) {
+					socket.send(JSON.stringify(result ?? { id: msg.id, kind: "result", error: "no-sw-response" }));
 				}
 			} catch (err) {
-				if (ws && ws.readyState === WebSocket.OPEN) {
-					ws.send(
+				if (socket.readyState === WebSocket.OPEN) {
+					socket.send(
 						JSON.stringify({
 							id: msg.id,
 							kind: "result",
@@ -176,13 +219,17 @@ async function connect() {
 		}
 	};
 
-	ws.onerror = (event) => {
+	socket.onerror = (event) => {
+		if (ws !== socket) return;
 		console.warn("[tek] WS error", event);
 	};
 
-	ws.onclose = (event) => {
+	socket.onclose = (event) => {
+		if (ws !== socket) return;
 		console.log("[tek] WS close", event.code, event.reason);
 		ws = null;
+		stopHeartbeat();
+		lastServerMessageAt = 0;
 		// 4401 = unauthorized (bad/missing token). Still reconnect — user may paste a new token.
 		const closeReason = event.code === 4401 ? "unauthorized" : "closed";
 		setState("disconnected", closeReason);
@@ -227,6 +274,20 @@ async function downscaleBase64PNG(b64, maxWidth) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
+	if (msg.kind === "control-state-changed") {
+		controlState = {
+			paused: msg.control?.paused === true,
+			grantedTabCount: Array.isArray(msg.control?.allowedTabIds)
+				? msg.control.allowedTabIds.length
+				: 0,
+		};
+		if (ws && ws.readyState === WebSocket.OPEN) {
+			ws.send(JSON.stringify({ kind: "control_state", control: controlState }));
+		}
+		broadcastStatus();
+		sendResponse({ ok: true });
+		return true;
+	}
 	if (msg.kind === "auth-updated") {
 		reconnectNow();
 		sendResponse({ ok: true });
