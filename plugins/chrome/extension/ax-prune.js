@@ -9,7 +9,7 @@
 
 export const MAX_AX_BYTES = 100 * 1024; // 100 KB
 
-export function pruneAxTree(nodes) {
+export function pruneAxTree(nodes, { maxBytes = MAX_AX_BYTES } = {}) {
 	const kept = nodes
 		.filter((n) => {
 			const role = n.role?.value;
@@ -26,11 +26,14 @@ export function pruneAxTree(nodes) {
 			description: n.description?.value,
 			parentId: n.parentId,
 		}));
+	if (!Number.isFinite(maxBytes)) {
+		return { axTree: kept, truncated: false, totalNodes: kept.length };
+	}
 
 	let subset = kept;
 	let serialized = JSON.stringify(subset);
 	let truncated = false;
-	while (serialized.length > MAX_AX_BYTES && subset.length > 1) {
+	while (serialized.length > maxBytes && subset.length > 1) {
 		truncated = true;
 		subset = subset.slice(0, Math.floor(subset.length * 0.7));
 		serialized = JSON.stringify(subset);

@@ -126,6 +126,26 @@ export function _rpc(tool, args, timeoutMs = 30_000) {
 	});
 }
 
+const PAGE_MODE_PROPERTY = {
+	type: "string",
+	enum: ["summary", "interactive", "full", "none"],
+	description:
+		"Page detail returned after the operation. interactive (default) returns bounded actionable controls; summary is smaller; full is paged and should be requested through read_page for deliberate drill-down; none skips page state.",
+	default: "interactive",
+};
+
+const PAGE_NUMBER_PROPERTY = {
+	type: "number",
+	description:
+		"1-based result page. Use nextPage while hasMore is true. Applies to both accessibility nodes and visible text.",
+	default: 1,
+};
+
+const PAGE_SIZE_PROPERTY = {
+	type: "number",
+	description: "Accessibility nodes per page (default depends on mode, capped at 500).",
+};
+
 export async function register(ctx) {
 	const cfg = ctx.getConfig?.() ?? {};
 	const port = Number(cfg.wsPort) || 52871;
@@ -316,7 +336,7 @@ export async function register(ctx) {
 
 	ctx.addTool("read_page", {
 		description:
-			"Read a granted tab's visible text and pruned accessibility tree. Returns { text, axTree, truncated, totalNodes }. Nodes include axNodeId plus backendDOMNodeId; prefer backendDOMNodeId for click/input. text is innerText (max 50 KB).",
+			"Read bounded state from a granted tab. Default mode:interactive returns visible text plus actionable accessibility nodes. Use mode:summary for a smaller overview or mode:full with page/nextPage to inspect every normalized node and all visible text without one huge response. Returns { mode, text, axTree, page, totalPages, hasMore, nextPage?, totalNodes }. Prefer backendDOMNodeId for click/input.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -324,6 +344,9 @@ export async function register(ctx) {
 					type: "number",
 					description: "Tab to read. Defaults to active tab.",
 				},
+				mode: PAGE_MODE_PROPERTY,
+				page: PAGE_NUMBER_PROPERTY,
+				pageSize: PAGE_SIZE_PROPERTY,
 			},
 			additionalProperties: false,
 		},
@@ -357,9 +380,9 @@ export async function register(ctx) {
 				returnPage: {
 					type: "boolean",
 					description:
-						"When auto-clicking, include the post-click page state in clicked.page (default true).",
-					default: true,
+						"Legacy compatibility flag. false equals pageMode:none; true equals pageMode:interactive.",
 				},
+				pageMode: PAGE_MODE_PROPERTY,
 			},
 			additionalProperties: false,
 		},
@@ -368,7 +391,7 @@ export async function register(ctx) {
 
 	ctx.addTool("click", {
 		description:
-			"Click an element in a user-granted tab. Pass selector, backendDOMNodeId (preferred), or axNodeId from chrome__find/read_page. Returns { ok, reason?, x, y, page? }. By default it includes a fresh pruned AX tree after the action. Uses trusted, tab-targeted CDP Input events and does not move the Mac's pointer.",
+			"Click an element in a user-granted tab. Pass selector, backendDOMNodeId (preferred), or axNodeId from chrome__find/read_page. Returns { ok, reason?, x, y, page? }. The default page is a bounded interactive snapshot; use pageMode:none in tight loops, or read_page mode:full for paged drill-down. Uses trusted, tab-targeted CDP Input events and does not move the Mac's pointer.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -385,9 +408,9 @@ export async function register(ctx) {
 				returnPage: {
 					type: "boolean",
 					description:
-						"Include post-click pruned AX tree in result.page (default true). Set false in tight loops where you already know the next selector.",
-					default: true,
+						"Legacy compatibility flag. false equals pageMode:none; true equals pageMode:interactive.",
 				},
+				pageMode: PAGE_MODE_PROPERTY,
 				settleMs: {
 					type: "number",
 					description:
@@ -401,7 +424,7 @@ export async function register(ctx) {
 
 	ctx.addTool("form_input", {
 		description:
-			"Type text into an input. Focuses the element first by clicking (same selector/axNodeId semantics as chrome__click). Returns { ok, reason?, page? }. By default returns a fresh AX snapshot in result.page after the keystrokes settle, so you don't need a follow-up read_page.",
+			"Type text into an input. Focuses the element first by clicking (same selector/axNodeId semantics as chrome__click). Returns { ok, reason?, page? }. The default page is a bounded interactive snapshot; use pageMode:none when the next target is already known.",
 		parameters: {
 			type: "object",
 			properties: {
@@ -422,9 +445,10 @@ export async function register(ctx) {
 				},
 				returnPage: {
 					type: "boolean",
-					description: "Include post-input pruned AX tree in result.page (default true).",
-					default: true,
+					description:
+						"Legacy compatibility flag. false equals pageMode:none; true equals pageMode:interactive.",
 				},
+				pageMode: PAGE_MODE_PROPERTY,
 				settleMs: {
 					type: "number",
 					description: "Milliseconds to wait after typing before capturing page state (default 250).",
@@ -484,9 +508,10 @@ export async function register(ctx) {
 				},
 				returnPage: {
 					type: "boolean",
-					description: "Include post-fill pruned AX tree in result.page (default true).",
-					default: true,
+					description:
+						"Legacy compatibility flag. false equals pageMode:none; true equals pageMode:interactive.",
 				},
+				pageMode: PAGE_MODE_PROPERTY,
 				settleMs: {
 					type: "number",
 					description: "Milliseconds to wait after each field / before final capture (default 250).",

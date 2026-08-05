@@ -13,6 +13,7 @@
  */
 
 import { pruneAxTree } from "./ax-prune.js";
+import { resolvePageMode, shapePageState } from "./page-shape.js";
 import {
 	grantTab,
 	isTabAllowed,
@@ -221,30 +222,46 @@ if (chrome.debugger?.onEvent) {
 /* ---------------- tool helpers ---------------- */
 
 /**
- * Capture a fresh page snapshot (pruned AX tree + innerText) after a settle delay.
+ * Capture a fresh, bounded page snapshot after a settle delay.
  * Used by click/form_input/form_fill to return the post-action state in one
  * round trip — the agent doesn't need to immediately call read_page after every
- * interaction. Returns the same shape as read_page.
+ * interaction. Interactive state is the safe default; full state remains
+ * available in deterministic pages through read_page({ mode:"full", page:N }).
  */
-async function capturePageDelta(tabId, settleMs = 250, includeText = false) {
-	await new Promise((r) => setTimeout(r, settleMs));
+async function capturePageState(tabId, args = {}, includeText = false) {
+	const mode = resolvePageMode(args);
+	if (mode === "none") return null;
+	const settleMs = args.settleMs ?? 250;
+	if (settleMs > 0) await new Promise((r) => setTimeout(r, settleMs));
 	const target = { tabId };
 	const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
-	const pruned = pruneAxTree(ax?.nodes || []);
-	const out = {
-		axTree: pruned.axTree,
-		truncated: pruned.truncated,
-		totalNodes: pruned.totalNodes,
-	};
+	// Normalize all nodes in extension memory. shapePageState applies the bounded
+	// response window, so full inspection can page past the old first-100KB cap.
+	const normalized = pruneAxTree(ax?.nodes || [], { maxBytes: Number.POSITIVE_INFINITY });
+	let text = "";
 	if (includeText) {
 		const evalRes = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
 			expression: "document.body ? document.body.innerText : ''",
 			returnByValue: true,
 		});
-		out.text = String(evalRes?.result?.value ?? "")
-			.replace(/\s+\n/g, "\n")
-			.trim()
-			.slice(0, 50000);
+		text = String(evalRes?.result?.value ?? "");
+	}
+	const out = shapePageState(normalized.axTree, text, {
+		mode,
+		page: args.page,
+		pageSize: args.pageSize,
+	});
+	if (!out) return null;
+	if (!includeText) {
+		delete out.text;
+		delete out.textChars;
+	}
+	try {
+		const tab = await chrome.tabs.get(tabId);
+		out.url = tab.url ?? "";
+		out.title = tab.title ?? "";
+	} catch {
+		// AX state is still useful if tab metadata races a navigation.
 	}
 	return out;
 }
@@ -351,26 +368,7 @@ const TOOL_HANDLERS = {
 	read_page: async (args = {}) => {
 		const tabId = await resolveTabId(args);
 		await ensureAttached(tabId);
-		const target = { tabId };
-		const ax = await chrome.debugger.sendCommand(
-			target,
-			"Accessibility.getFullAXTree",
-			{},
-		);
-		const pruned = pruneAxTree(ax?.nodes || []);
-		const evalRes = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-			expression: "document.body ? document.body.innerText : ''",
-			returnByValue: true,
-		});
-		const text = String(evalRes?.result?.value ?? "")
-			.replace(/\s+\n/g, "\n")
-			.trim();
-		return {
-			text: text.slice(0, 50000),
-			axTree: pruned.axTree,
-			truncated: pruned.truncated,
-			totalNodes: pruned.totalNodes,
-		};
+		return capturePageState(tabId, { ...args, settleMs: 0 }, true);
 	},
 	find: async (args = {}) => {
 		const tabId = await resolveTabId(args);
@@ -435,7 +433,7 @@ const TOOL_HANDLERS = {
 			else if (typeof args.selector === "string") clickArgs.selector = args.selector;
 			const clickRes = await TOOL_HANDLERS.click({
 				...clickArgs,
-				returnPage: args.returnPage !== false,
+				pageMode: resolvePageMode(args),
 			});
 			return { matches, clicked: clickRes };
 		}
@@ -501,9 +499,9 @@ const TOOL_HANDLERS = {
 			clickCount: 1,
 		});
 		const result = { ok: true, x: box.x, y: box.y };
-		if (args.returnPage !== false) {
+		if (resolvePageMode(args) !== "none") {
 			try {
-				result.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+				result.page = await capturePageState(tabId, args, false);
 			} catch (e) {
 				// Don't fail the click if AX capture stumbles — just note it.
 				result.pageError = String(e?.message ?? e);
@@ -557,9 +555,9 @@ const TOOL_HANDLERS = {
 			}
 		}
 		const result = { ok: true };
-		if (args.returnPage !== false) {
+		if (resolvePageMode(args) !== "none") {
 			try {
-				result.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+				result.page = await capturePageState(tabId, args, false);
 			} catch (e) {
 				result.pageError = String(e?.message ?? e);
 			}
@@ -589,9 +587,9 @@ const TOOL_HANDLERS = {
 			results.push({ index: i, ok: !!r?.ok, reason: r?.reason });
 			if (!r?.ok && args.stopOnError !== false) {
 				const out = { ok: false, results, failedAt: i, reason: r?.reason };
-				if (args.returnPage !== false) {
+				if (resolvePageMode(args) !== "none") {
 					try {
-						out.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+						out.page = await capturePageState(tabId, args, false);
 					} catch {
 						// ignore
 					}
@@ -618,9 +616,9 @@ const TOOL_HANDLERS = {
 		}
 		const out = { ok: true, results };
 		if (submitted) out.submitted = submitted;
-		if (args.returnPage !== false) {
+		if (resolvePageMode(args) !== "none") {
 			try {
-				out.page = await capturePageDelta(tabId, args.settleMs ?? 250, false);
+				out.page = await capturePageState(tabId, args, false);
 			} catch (e) {
 				out.pageError = String(e?.message ?? e);
 			}

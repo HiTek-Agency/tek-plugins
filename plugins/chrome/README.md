@@ -44,7 +44,7 @@ Use **Take over** whenever you want exclusive control. **Resume agents** restore
 | `chrome__tabs_list` | List only tabs explicitly granted by the user |
 | `chrome__tabs_create` | Open a new tab |
 | `chrome__navigate` | Navigate a tab to a URL (or go back/forward/reload) |
-| `chrome__read_page` | Read page text / AX-tree snapshot |
+| `chrome__read_page` | Read bounded page state; use `mode:summary`, `interactive` (default), or paged `full` |
 | `chrome__find` | Locate element(s) by text, role, or selector |
 | `chrome__click` | Click an element by id from a prior read/find |
 | `chrome__form_input` | Type text into input / select / textarea |
@@ -52,6 +52,12 @@ Use **Take over** whenever you want exclusive control. **Resume agents** restore
 | `chrome__wait_for` | Wait for an element or text to appear or disappear |
 | `chrome__screenshot` | Capture visible viewport as PNG (downscaled to `screenshotMaxWidth`) |
 | `chrome__javascript_tool` | Evaluate JS in the page (always requires user approval) |
+
+### Page-state budgets
+
+Chrome returns compact interactive state by default so long browser workflows do not attach the complete accessibility tree after every action. Set `pageMode:none` on click/input/fill when the next target is already known. For deliberate deep inspection, call `chrome__read_page` with `mode:"full"`, then follow `nextPage` while `hasMore` is true. Full mode preserves every normalized accessibility node and visible page text through bounded pages rather than one oversized response.
+
+The legacy `returnPage` flag remains compatible: `false` maps to `pageMode:none`, while `true` maps to the bounded `interactive` mode.
 
 ## Troubleshooting
 

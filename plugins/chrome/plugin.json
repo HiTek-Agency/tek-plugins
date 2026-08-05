@@ -1,8 +1,8 @@
 {
 	"id": "chrome",
 	"name": "Chrome Control",
-	"version": "0.3.0",
-	"description": "Drive user-granted Chrome tabs through a model-agnostic local bridge with explicit pause, takeover, navigation, page reads, clicks, forms, screenshots, waits, and JavaScript",
+	"version": "0.4.0",
+	"description": "Drive user-granted Chrome tabs through a model-agnostic local bridge with bounded page-state modes, paged full inspection, explicit pause, takeover, navigation, clicks, forms, screenshots, waits, and JavaScript",
 	"entryPoint": "dist/index.js",
 	"permissions": ["tools", "config", "context", "ws-handlers"],
 	"configSchema": [
