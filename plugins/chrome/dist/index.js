@@ -198,12 +198,16 @@ export async function register(ctx) {
 			if (_sock === ws && !_client) ws.close(4002, "hello-timeout");
 		}, 5_000);
 		ws.on("message", (raw) => {
+			// A replaced connection can still deliver queued events while closing.
+			// Only the current connection may update handshake state or settle RPCs.
+			if (_sock !== ws) return;
 			let msg;
 			try {
 				msg = JSON.parse(raw.toString());
 			} catch {
 				return;
 			}
+			if (!msg || typeof msg !== "object" || Array.isArray(msg)) return;
 			_lastMessageAt = Date.now();
 			if (msg.kind === "hello") {
 				clearTimeout(helloTimer);
@@ -217,7 +221,7 @@ export async function register(ctx) {
 					control: msg.control ?? null,
 				};
 				ctx.logger?.info?.(
-					`chrome-control connected: ext=${msg.extensionId} v${msg.version} chrome=${msg.chromeVersion} caps=[${(msg.capabilities || []).join(",")}]`,
+					`chrome-control connected: ext=${msg.extensionId} v${msg.version} chrome=${msg.chromeVersion} caps=[${_client.capabilities.join(",")}]`,
 				);
 				ws.send(
 					JSON.stringify({
@@ -574,16 +578,18 @@ export async function register(ctx) {
 			const maxWidth = Number(args?.maxWidth) || Number(cfg.screenshotMaxWidth) || 1920;
 			const result = await _rpc("screenshot", { ...(args ?? {}), maxWidth }, 60_000);
 			const ts = Date.now();
-			const filename = `chrome-${ts}.png`;
+			const filename = `chrome-${ts}-${randomUUID()}.png`;
 			const fullPath = join(SCREENSHOT_DIR, filename);
 			writeFileSync(fullPath, Buffer.from(result.base64, "base64"));
 			const toolCallId = execOptions?.toolCallId || `chrome-screenshot-${ts}`;
 			try {
 				ctx.send?.({
-					kind: "image.generated",
+					type: "image.generated",
 					toolCallId,
 					path: fullPath,
-					thumbnailBase64: result.base64,
+					thumbnail: result.thumbnail || result.base64,
+					provider: "chrome",
+					model: "viewport",
 					width: result.width,
 					height: result.height,
 					prompt: `Chrome screenshot (tab ${args?.tabId ?? "active"})`,

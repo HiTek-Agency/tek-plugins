@@ -15,9 +15,7 @@ const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
 const HEARTBEAT_MS = 15_000;
 const STALE_CONNECTION_MS = 45_000;
-// Offscreen WORKERS context doesn't expose chrome.runtime.getManifest.
-// Keep in sync with manifest.json "version".
-const EXT_VERSION = "0.3.0";
+
 
 /** @type {WebSocket | null} */
 let ws = null;
@@ -150,7 +148,7 @@ async function connect() {
 		const hello = {
 			kind: "hello",
 			protocolVersion: 1,
-			version: EXT_VERSION,
+			version: null,
 			chromeVersion: getChromeVersion(),
 			extensionId,
 			capabilities: ["tabs", "debugger", "scripting", "screenshot", "control-lease"],
@@ -158,6 +156,7 @@ async function connect() {
 		try {
 			const status = await chrome.runtime.sendMessage({ kind: "get-control-status" });
 			if (status?.ok) {
+				hello.version = status.extensionVersion ?? null;
 				controlState = {
 					paused: status.paused === true,
 					grantedTabCount: Number(status.grantedTabCount) || 0,
@@ -269,7 +268,18 @@ async function downscaleBase64PNG(b64, maxWidth) {
 	const bytes = new Uint8Array(buf);
 	let bin = "";
 	for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-	return { base64: btoa(bin), width: w, height: h };
+	const previewRatio = Math.min(1, 240 / Math.max(bitmap.width, bitmap.height));
+	const preview = new OffscreenCanvas(Math.max(1, Math.round(bitmap.width * previewRatio)), Math.max(1, Math.round(bitmap.height * previewRatio)));
+	const previewContext = preview.getContext("2d");
+	previewContext.fillStyle = "white";
+	previewContext.fillRect(0, 0, preview.width, preview.height);
+	previewContext.drawImage(bitmap, 0, 0, preview.width, preview.height);
+	const previewBlob = await preview.convertToBlob({ type: "image/jpeg", quality: 0.75 });
+	const previewBytes = new Uint8Array(await previewBlob.arrayBuffer());
+	let previewBinary = "";
+	for (const byte of previewBytes) previewBinary += String.fromCharCode(byte);
+	bitmap.close();
+	return { base64: btoa(bin), thumbnail: btoa(previewBinary), width: w, height: h };
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

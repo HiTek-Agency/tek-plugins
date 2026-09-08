@@ -22,12 +22,12 @@
  *                     [--gateway-port 3271] \
  *                     [--fixture-url file:///abs/path/to/test-page.html]
  *
- * The gateway WS listens on 127.0.0.1:<apiEndpoint.port> and does not require
- * a bearer token for loopback connections — it treats loopback/Tailscale as
- * pre-authenticated at the network layer. See gateway/src/ws/server.ts.
+ * The gateway requires TEK_GATEWAY_TOKEN even on loopback. Supply it via a
+ * local credential provider, never a command-line argument. Open and grant ONLY
+ * the fixture tab before running. The test never grants browser access itself.
  */
 import WebSocket from "ws";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -78,19 +78,19 @@ const FIXTURE =
 const PROMPTS = [
 	{
 		name: "screenshot",
-		prompt: `Take a screenshot of my current Chrome tab.`,
+		prompt: `Call chrome__screenshot for the fixture tab and finish.`,
 	},
 	{
 		name: "navigate+read",
-		prompt: `Navigate the active tab to ${FIXTURE} and then read the page and tell me the value of the h1.`,
+		prompt: `Call chrome__navigate with the fixture tab ID and url ${FIXTURE} and then read the page and tell me the value of the h1.`,
 	},
 	{
 		name: "find+click",
-		prompt: `On the current tab, find the link with id "target-link" and click it. Then read the page and tell me what the click-receipt paragraph says.`,
+		prompt: `Use chrome__find to find the link named "Click me". Then use chrome__click with selector "#target-link" on the fixture tab. Read the page and confirm CLICKED_OK.`,
 	},
 	{
 		name: "form_input",
-		prompt: `On the current tab, type the text "hello-tek-e2e" into the input with id "target-input". Then read the page and tell me what the input-mirror paragraph says.`,
+		prompt: `Call chrome__form_input with selector "#target-input", text "hello-tek-e2e", clear true, and the fixture tab ID. Read the page and confirm TYPED:hello-tek-e2e.`,
 	},
 	{
 		name: "javascript_tool",
@@ -99,8 +99,13 @@ const PROMPTS = [
 ];
 
 // ── helpers ──────────────────────────────────────────────────────────
+const gatewayToken = process.env.TEK_GATEWAY_TOKEN;
+if (!gatewayToken) {
+    console.error("Set TEK_GATEWAY_TOKEN through a local credential provider; the gateway requires authentication.");
+    process.exit(2);
+}
 function openWs() {
-	return new WebSocket(`ws://127.0.0.1:${PORT}/gateway`);
+    return new WebSocket(`ws://127.0.0.1:${PORT}/gateway`, ["tek-auth", `tek-token.${gatewayToken}`]);
 }
 
 async function runOne(prompt, name) {
@@ -113,8 +118,8 @@ async function runOne(prompt, name) {
 			try {
 				sock.close();
 			} catch {}
-			resolveP({ name, ok: false, reason: "timeout 120s", events });
-		}, 120_000);
+			resolveP({ name, ok: false, reason: "timeout 180s", events });
+		}, 180_000);
 
 		sock.on("open", () => {
 			sock.send(
@@ -122,7 +127,8 @@ async function runOne(prompt, name) {
 					type: "chat.send",
 					id: reqId,
 					agentId: AGENT_ID,
-					content: prompt,
+					content: `Use only the already-open, user-granted test tab at ${FIXTURE}. Identify it by that exact URL. Do not navigate, read, screenshot, or change any other tab. If it is missing or not granted, stop and report that. Use only chrome__ tools for this test. ${prompt}`,
+                    ...(args.model ? { model: args.model } : {}),
 				}),
 			);
 		});
@@ -136,7 +142,7 @@ async function runOne(prompt, name) {
 			}
 			events.push(m);
 
-			// Auto-approve any pending tool approval (chrome__javascript_tool is
+			// Approve only Chrome tools within the explicitly granted fixture test (the JS tool is
 			// marked dangerous and will request one on first use per session).
 			if (m.type === "tool.approval.request") {
 				sock.send(
@@ -144,8 +150,8 @@ async function runOne(prompt, name) {
 						type: "tool.approval.response",
 						id: `approve-${m.toolCallId}`,
 						toolCallId: m.toolCallId,
-						approved: true,
-						sessionApprove: true,
+						approved: typeof m.toolName === "string" && m.toolName.startsWith("chrome__"),
+						sessionApprove: false,
 					}),
 				);
 			}
@@ -162,6 +168,10 @@ async function runOne(prompt, name) {
 			}
 		});
 
+        sock.on("close", (code, reason) => {
+            clearTimeout(timer);
+            resolveP({ name, ok: false, reason: `socket closed ${code}: ${String(reason)}`, events });
+        });
 		sock.on("error", (e) => {
 			clearTimeout(timer);
 			resolveP({ name, ok: false, reason: e.message, events });
@@ -198,7 +208,7 @@ function assertContainsTool(result, toolNamePattern) {
 					: navMiss || readMiss;
 			}
 			if (p.name === "find+click") {
-				assertion = assertContainsTool(r, "chrome__(find|click)");
+				assertion = assertContainsTool(r, "chrome__find") || assertContainsTool(r, "chrome__click");
 			}
 			if (p.name === "form_input") {
 				assertion = assertContainsTool(r, "chrome__form_input");
@@ -207,13 +217,34 @@ function assertContainsTool(result, toolNamePattern) {
 				assertion = assertContainsTool(r, "chrome__javascript_tool");
 			}
 		}
-		results.push({ ...r, assertion });
+        if (r.ok && !assertion) {
+            const failedTool = r.events.find((event) => {
+                let result = event.result;
+                if (typeof result === "string") { try { result = JSON.parse(result); } catch {} }
+                return event.type === "tool.error" || event.type === "tool.result" && (event.isError || event.error || result?.success === false || result?.ok === false || result?.error);
+            });
+            if (failedTool) assertion = `tool reported failure: ${failedTool.toolName ?? failedTool.toolCallId}`;
+        }
+		const text = r.events.filter((event) => event.type === "tool.result" || event.type === "chat.stream.delta").map((event) => JSON.stringify(event)).join("\n");
+        if (r.ok && !assertion && p.name === "find+click" && !text.includes("CLICKED_OK")) assertion = "click receipt missing";
+        if (r.ok && !assertion && p.name === "form_input" && !text.includes("TYPED:hello-tek-e2e")) assertion = "input receipt missing";
+        results.push({ ...r, assertion });
+        if (!r.ok || assertion) {
+            console.log("  calls:", r.events.filter((event) => event.type === "tool.call").map((event) => event.toolName).join(", "));
+            console.log("  errors:", r.events.filter((event) => event.type === "error" || event.type === "tool.error").map((event) => event.error || event.message).join("; "));
+        }
 		process.stdout.write(
 			`  → ${r.ok ? (assertion ? `FAIL: ${assertion}` : "PASS") : `ERROR: ${r.reason}`}\n`,
 		);
 	}
 
-	const failed = results.filter((r) => !r.ok || r.assertion);
+	if (typeof args.report === "string") {
+        // Strip image bytes and tab-list contents; keep fixture actions for diagnosis.
+        writeFileSync(args.report, JSON.stringify(results.map(({ events, images, ...result }) => ({
+            ...result, toolResults: undefined, events: events.filter((event) => ["tool.call", "tool.error", "error", "chat.stream.delta", "chat.stream.end"].includes(event.type)),
+        })), null, 2), { mode: 0o600 });
+    }
+    const failed = results.filter((r) => !r.ok || r.assertion);
 	console.log(`\n${"=".repeat(60)}`);
 	console.log(`E2E SUMMARY: ${results.length - failed.length}/${results.length} passed`);
 	for (const r of results) {

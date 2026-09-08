@@ -6,6 +6,7 @@
 
 const dotEl = document.getElementById("status-dot");
 const statusTextEl = document.getElementById("status-text");
+document.getElementById("extension-version").textContent = chrome.runtime.getManifest().version;
 const gatewayVersionEl = document.getElementById("gateway-version");
 const tokenSection = document.getElementById("token-section");
 const tokenInput = document.getElementById("token-input");

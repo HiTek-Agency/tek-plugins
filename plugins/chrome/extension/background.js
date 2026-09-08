@@ -1,3 +1,4 @@
+import { navigateTab } from "./navigation.js";
 /**
  * Tek Chrome Control — background service worker (MV3).
  *
@@ -295,23 +296,6 @@ async function dispatchToolCall(tool, args = {}) {
 	return TOOL_HANDLERS[tool]({ ...args, tabId });
 }
 
-async function waitForLoad(tabId, timeoutMs = 30000) {
-	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
-			chrome.tabs.onUpdated.removeListener(listener);
-			reject(new Error("navigation timed out"));
-		}, timeoutMs);
-		const listener = (id, info) => {
-			if (id === tabId && info.status === "complete") {
-				clearTimeout(timer);
-				chrome.tabs.onUpdated.removeListener(listener);
-				resolve();
-			}
-		};
-		chrome.tabs.onUpdated.addListener(listener);
-	});
-}
-
 async function resolveBackendDOMNodeId(target, args) {
 	if (Number.isInteger(args.backendDOMNodeId)) return args.backendDOMNodeId;
 	if (args.axNodeId == null) return null;
@@ -360,9 +344,7 @@ const TOOL_HANDLERS = {
 	navigate: async (args = {}) => {
 		const tabId = await resolveTabId(args);
 		if (typeof args.url !== "string") throw new Error("url required");
-		await chrome.tabs.update(tabId, { url: args.url });
-		await waitForLoad(tabId);
-		const tab = await chrome.tabs.get(tabId);
+		const tab = await navigateTab(chrome.tabs, tabId, args.url);
 		return { tabId, url: tab.url, title: tab.title };
 	},
 	read_page: async (args = {}) => {
@@ -752,6 +734,7 @@ const TOOL_HANDLERS = {
 		});
 		return {
 			base64: downscaled.base64,
+			thumbnail: downscaled.thumbnail,
 			width: downscaled.width,
 			height: downscaled.height,
 		};
@@ -815,7 +798,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 	if (msg.kind === "get-control-status") {
 		controlStatus()
-			.then((status) => sendResponse({ ok: true, ...status }))
+			.then((status) => sendResponse({ ok: true, ...status, extensionVersion: chrome.runtime.getManifest().version }))
 			.catch((error) => sendResponse({ ok: false, error: String(error?.message ?? error) }));
 		return true;
 	}

@@ -1,9 +1,12 @@
 {
 	"name": "@tek-plugins/chrome",
-	"version": "0.4.0",
+	"version": "0.4.3",
 	"type": "module",
 	"main": "dist/index.js",
 	"dependencies": {
 		"ws": "^8.21.0"
+	},
+	"scripts": {
+		"test": "node --experimental-test-module-mocks --test test/*.test.mjs"
 	}
 }

@@ -1,55 +1,48 @@
-# Chrome Control E2E Test
+# Chrome Control live test
 
-Validates **SC-9** of Phase 101: an agent can navigate, screenshot, read, click,
-type, and evaluate JS — all results observable in the chat transcript.
+Runs five isolated agent turns through the authenticated gateway and the actual
+Chrome extension: screenshot, navigation/read, find/click, form input, and JS.
 
-## Prereqs
+## Preparation
 
-- Tek gateway running locally (`~/tek/bin/tek gateway status` shows running)
-- Chrome Control plugin installed and **enabled** in the Tek desktop
-- Chrome open with the extension loaded unpacked; popup shows green "Connected"
-- An agent configured with the chrome tool group enabled
-  (`full` or `developer` tool profile — see `packages/gateway/src/agent/tool-profiles.ts`)
-- The `ws` npm package available in this plugin dir (it is already a runtime
-  dependency; run `npm install` from `plugins/chrome/` if `node_modules` is
-  missing)
+1. Run the local gateway with Chrome Control enabled and a Chrome-capable agent.
+2. Serve this directory's fixture with
+   `python3 -m http.server 4321 --bind 127.0.0.1 --directory test/fixtures`.
+3. Open `http://127.0.0.1:4321/test-page.html` in a dedicated Chrome tab and grant
+   **that tab** in the extension popup. Confirm that the popup says Connected.
+4. Supply `TEK_GATEWAY_TOKEN` in the process environment through a local credential
+   provider. Authentication is required even on loopback. Never put the token in
+   command-line arguments, test reports, or source files.
 
-## Run
-
-```bash
-node test/e2e.mjs --agent <agent-id>
+```sh
+node test/e2e.mjs --agent tek --model openai-codex:gpt-6-astra \
+  --fixture-url http://127.0.0.1:4321/test-page.html
 ```
 
-Optional flags:
+The test asks the agent to identify only the exact fixture URL; it does not grant
+access or manipulate unrelated tabs. It approves only `chrome__` tool requests.
+The optional `--gateway-port` overrides the configured local gateway port.
+`--report /absolute/path/report.json` saves diagnostic tool calls, streamed text,
+and errors, excluding image bytes and tab-list results. Reports may contain
+fixture conversation content and are written with mode 0600. No report is needed
+for the test to run. Each prompt has a 180-second timeout.
 
-- `--gateway-port 3271` — override the port read from `~/.config/tek/config.json`
-  (`apiEndpoint.port`)
-- `--fixture-url file:///path/to/page.html` — override the default fixture
-  served from `test/fixtures/test-page.html`
+A pass requires the named tools, no reported tool failure, an image event for
+screenshots, and the fixture's click/input receipts. All five prompts must pass
+for exit code 0. Exit code 1 means a failure; exit code 2 means missing setup.
+An agent calling a tool without completing the requested action is not a pass.
 
-## What it does
+Afterward revoke the fixture tab, close it, and stop the fixture server. Test
+conversations remain in gateway history for diagnosis; no email or external page
+is submitted by the fixture.
 
-Runs 5 chat prompts sequentially, each opening a fresh WebSocket to
-`ws://127.0.0.1:<port>/` (the gateway WS — loopback is pre-authenticated, no
-bearer token needed). Assertions per prompt:
+## Verified locally
 
-| # | Prompt | Asserts |
-|---|--------|---------|
-| 1 | Screenshot current tab | `chrome__screenshot` tool called AND `image.generated` side-channel emitted |
-| 2 | Navigate to fixture + read h1 | `chrome__navigate` or `chrome__read_page` called |
-| 3 | Find + click link `#target-link` | `chrome__find` or `chrome__click` called |
-| 4 | Type into `#target-input` | `chrome__form_input` called |
-| 5 | Evaluate `window.__tekE2E.ready` | `chrome__javascript_tool` called |
+2026-09-07: gateway **0.6.36 build 235**, plugin/extension **0.4.3**, all **5/5**
+checks passed with Astra. The screenshot also persisted in its originating
+session: 60,582-byte PNG on disk and a 1,752-byte JPEG history preview. Native
+popup displayed extension 0.4.3 / gateway 0.6.36. The temporary tab grant was
+revoked afterward, restoring the original seven grants.
 
-Auto-approves any `tool.approval.request` (so `chrome__javascript_tool` runs
-without manual intervention even when its approval tier is `always`).
-
-Exit code: `0` on all-pass, `1` on any failure. On failure, the test prints
-per-prompt status and the assertion error.
-
-## Manual verification
-
-- Watch Chrome: the fixture page should appear in the active tab and the
-  yellow "Tek is debugging this browser — Cancel" banner should be visible.
-- Open Tek desktop chat for the agent: the screenshot from prompt 1 should
-  render inline (not raw JSON).
+`npm test` covers permission policy, navigation, page shaping, socket replacement,
+and the screenshot event format without a live gateway or browser.
