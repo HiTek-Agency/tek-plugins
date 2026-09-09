@@ -2,7 +2,7 @@
 
 Join Google Meet as an observer (silent transcription + notes) or a wake-word participant (listens passively, speaks only when a wake-word fires). Local whisper transcription, DOM-based speaker attribution, post-meeting Google Doc + chat summary + on-disk archive.
 
-> **Status: Scaffold — plan 104-01b only seeds the file tree.** Plans 104-02..104-08 implement behavior (WS bootstrap, audio pipeline, wake-word, TTS injection, notes delivery, desktop status chip, E2E smoke test). Do not expect the tools to do anything real yet.
+> **0.1.1:** Desktop control and cleanup race coverage is available. Live Google sign-in, admission, audio, and post-meeting delivery still require separate acceptance; unit tests do not establish that those external flows work.
 
 The gateway-side plugin runs a local WebSocket server on `127.0.0.1:52881`. A companion MV3 Chrome extension (shipped in `extension/`) connects to that server from a dedicated Chrome profile and captures Meet tab audio via `chrome.tabCapture` + an offscreen document. Audio is streamed to the gateway as PCM16 frames and transcribed locally with `@fugood/whisper.node` (reused from the voice-input-stt plugin).
 
@@ -33,7 +33,7 @@ The extension ships inside this plugin's `extension/` directory (after install i
 3. Paste the token into the popup and click **Save**
 4. The status dot should turn green (**Connected**). Your agent can now join Meets.
 
-## Tools (scaffolded; behavior lands in plans 104-02..104-06)
+## Tools
 
 | Tool                       | Purpose                                                                     | Approval Tier            |
 | -------------------------- | --------------------------------------------------------------------------- | ------------------------ |
@@ -51,13 +51,60 @@ The tier is wired in `src/index.js` via the `ctx.addTool(..., { approvalTier })`
 - The bot **announces itself** in Meet chat on join (non-negotiable transparency — see phase 104 decision D-18).
 - Transcripts are stored locally at `~/.config/tek/meet-transcripts/<date>_<meet-code>_<slug>/`. A Google Doc copy is created only if the Google Workspace integration is authorised with `meetings.space.readonly` scope AND the user's agent has `googlePermissions.meet = "read"`.
 
-## Troubleshooting
+## Desktop control contract (0.1.1)
 
-**Popup shows "Scaffold — plan 104-02 wires connection status"**
-- Expected. This is plan 104-01b (scaffold only). Real popup behavior lands in plan 104-02.
+`plugin.meet.status` advertises `conditionalControlsVersion: 1` and `operation`
+(`null`, `join`, `signin`, `end`, `stop`, or `stop-failed`). `connected` describes
+the control service worker; the offscreen audio connection does not replace it.
+The displayed meeting ID/mode remain present while stopping or after an
+unconfirmed stop, so an empty connection is not mistaken for completed cleanup.
 
-**`meet__join_observer` or `meet__join_participant` returns `{ ok: false, reason: "scaffold-only" }`**
-- Also expected. The `execute()` handlers are placeholders. Real behavior lands in plans 104-02 (WS server + extension bootstrap) and 104-03/04/05 (audio pipeline, wake-word, TTS injection).
+- `plugin.meet.kick` accepts optional `expectedMeetingId` (string or null). A
+  mismatch returns correlated `ok: false, code: "MEET_CONFLICT"` before effects.
+  Omitted identity preserves the legacy emergency-stop action.
+- `plugin.meet.open-signin` accepts `expectedMeetingId: null` from the Desktop.
+  Active meetings and pending join/cleanup reject the action. A connected bot
+  uses the fixed, no-argument extension route `meet.open-signin`; general Meet
+  navigation does not gain an arbitrary URL exception.
+- Join/sign-in/cleanup are mutually exclusive. Kick can cancel a pending join or
+  sign-in immediately, initiates browser termination before a slow transcription
+  flush, and holds the operation gate until older setup/cleanup settles.
+- Old callbacks cannot send TTS, navigate, clear a new meeting, or append into a
+  new archive. Already accepted transcription drains into its captured archive.
+  A natural end drains that transcription before finalizing the archive.
+- Re-registration during cleanup fails clearly; repeated cleanup is coalesced,
+  and stale registration handlers cannot stop or close a newer registration.
+
+Chrome stop remains best effort at the operating-system boundary. A force-kill
+signal without observed process exit reports failure and retains the process
+handle and meeting evidence for an explicit stop retry. The plugin does not
+claim that an already dispatched Google request was undone. Setup or cleanup
+that never settles keeps new operations blocked; Chrome stop still starts
+immediately. An emergency kick preserves raw transcript chunks but does not
+implicitly create a Google Doc or start reconciliation.
+
+### Updating an existing bot extension
+
+After updating the plugin to **0.1.1**, open `chrome://extensions` in the dedicated
+bot profile and **Reload** the unpacked Tek Meet extension. It must also show
+version **0.1.1** to support the fixed sign-in route. An older running extension
+rejects that route and the Desktop reports the failure; update/reload it rather
+than treating the failed action as success. The bot profile/account is preserved.
+
+The registry installs `plugins/meet` from this repository's default Git branch.
+Publishing this version means merging/pushing the tested source and the matching
+`registry.json`, plugin/package, and extension manifest versions. There is no
+separate npm/CDN build or registry-publish workflow in this repository. Updating
+and enabling an installed plugin remain separate actions.
+
+### Verification limits
+
+`npm test` exercises real registration/tool/WS handlers with stubbed browser,
+socket, filesystem, transcription, and Google boundaries. It includes delayed
+setup, stop, finalization, reload, audio/control coexistence, and stale callback
+regressions without launching Chrome or sending network requests. The entry point
+is JavaScript source (`src/index.js`), so no separate compilation is required.
+The scripted live Meet test is opt-in and was not run for this release.
 
 ## Related
 

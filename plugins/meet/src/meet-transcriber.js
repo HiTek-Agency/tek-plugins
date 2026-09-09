@@ -71,8 +71,20 @@ export async function createTranscriber({
 	let bufSamples = 0;
 	let firstFrameAt = null;
 	let shutdownFlag = false;
+	let shutdownPromise = null;
+	const inFlight = new Set();
 
-	async function flush({ force = false, suppressed = false } = {}) {
+	function flush(options) {
+		const pending = flushBuffer(options);
+		inFlight.add(pending);
+		pending.then(
+			() => inFlight.delete(pending),
+			() => inFlight.delete(pending),
+		);
+		return pending;
+	}
+
+	async function flushBuffer({ force = false, suppressed = false } = {}) {
 		if (bufSamples === 0) return;
 		// Peek-first VAD: when NOT force-flushing, check speech BEFORE clearing
 		// the buffer. If VAD fails at the 1s mark we keep the buffer accruing
@@ -98,7 +110,11 @@ export async function createTranscriber({
 
 		// Buffer.from with byteOffset + byteLength avoids copying — we just
 		// expose the Int16Array's backing ArrayBuffer view as a node Buffer.
-		const pcmBuffer = Buffer.from(concat.buffer, concat.byteOffset, concat.byteLength);
+		const pcmBuffer = Buffer.from(
+			concat.buffer,
+			concat.byteOffset,
+			concat.byteLength,
+		);
 		try {
 			const { promise } = ctx.transcribeData(pcmBuffer, {
 				language: "en",
@@ -173,14 +189,21 @@ export async function createTranscriber({
 				await flush({ force: false, suppressed });
 			}
 		},
-		async shutdown() {
+		shutdown() {
+			if (shutdownPromise) return shutdownPromise;
 			shutdownFlag = true;
-			await flush({ force: true });
-			try {
-				await ctx.release?.();
-			} catch {
-				// ignore — best-effort release
-			}
+			shutdownPromise = (async () => {
+				// Socket ingestion is fire-and-forget. Drain transcriptions already
+				// dispatched before flushing the tail and releasing their context.
+				await Promise.allSettled([...inFlight]);
+				await flush({ force: true });
+				try {
+					await ctx.release?.();
+				} catch {
+					/* best-effort release */
+				}
+			})();
+			return shutdownPromise;
 		},
 	};
 }

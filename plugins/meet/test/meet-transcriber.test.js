@@ -27,7 +27,10 @@ test("transcriber uses injected initWhisperFn — no real @fugood/whisper.node n
 			calls++;
 			return {
 				stop() {},
-				promise: Promise.resolve({ segments: [{ text: "hello" }], duration: 1 }),
+				promise: Promise.resolve({
+					segments: [{ text: "hello" }],
+					duration: 1,
+				}),
 			};
 		},
 		release: async () => {},
@@ -44,7 +47,10 @@ test("transcriber uses injected initWhisperFn — no real @fugood/whisper.node n
 		await t.ingestFrame(makePcmBase64(1600), Date.now() + i * 100);
 	}
 	await t.shutdown();
-	assert.ok(chunks.length >= 1, `expected at least one chunk, got ${chunks.length}`);
+	assert.ok(
+		chunks.length >= 1,
+		`expected at least one chunk, got ${chunks.length}`,
+	);
 	assert.equal(chunks[0].text, "hello");
 	assert.equal(chunks[0].transcribe, true);
 	assert.equal(chunks[0].source, "whisper");
@@ -142,7 +148,8 @@ test("shutdown flushes remaining buffered audio", async () => {
 	});
 	// Only send 500ms of loud audio — below 1s CHUNK_TARGET so normal ingest
 	// won't flush. shutdown() must force-flush the residual.
-	for (let i = 0; i < 5; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	for (let i = 0; i < 5; i++)
+		await t.ingestFrame(makePcmBase64(1600), Date.now());
 	assert.equal(chunks.length, 0, "partial buffer should not flush mid-ingest");
 	await t.shutdown();
 	assert.ok(chunks.length >= 1, "shutdown should flush tail");
@@ -163,7 +170,8 @@ test("transcriber emits error chunk when whisper throws", async () => {
 		emitChunk: (c) => chunks.push(c),
 		initWhisperFn: async () => fakeCtx,
 	});
-	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	for (let i = 0; i < 10; i++)
+		await t.ingestFrame(makePcmBase64(1600), Date.now());
 	await t.shutdown();
 	const errChunk = chunks.find((c) => c.error);
 	assert.ok(errChunk, "expected an error chunk when whisper rejects");
@@ -188,13 +196,19 @@ test("plan 104-04: getSpeaker callback stamps speakerGuess into each emitted chu
 		getSpeaker: () => currentSpeaker,
 	});
 	// First chunk while no speaker is known → speakerGuess null
-	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	for (let i = 0; i < 10; i++)
+		await t.ingestFrame(makePcmBase64(1600), Date.now());
 	// Now simulate a DOM speaker.changed event — tracker updates its state
 	currentSpeaker = "Alice";
-	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	for (let i = 0; i < 10; i++)
+		await t.ingestFrame(makePcmBase64(1600), Date.now());
 	await t.shutdown();
 	assert.ok(chunks.length >= 2, `expected ≥2 chunks, got ${chunks.length}`);
-	assert.equal(chunks[0].speakerGuess, null, "first chunk predates speaker event");
+	assert.equal(
+		chunks[0].speakerGuess,
+		null,
+		"first chunk predates speaker event",
+	);
 	const aliceChunk = chunks.find((c) => c.speakerGuess === "Alice");
 	assert.ok(aliceChunk, "a chunk after speaker event should be tagged 'Alice'");
 });
@@ -214,7 +228,8 @@ test("plan 104-04: getSpeaker defaults to null-returning fn when not passed", as
 		emitChunk: (c) => chunks.push(c),
 		initWhisperFn: async () => fakeCtx,
 	});
-	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	for (let i = 0; i < 10; i++)
+		await t.ingestFrame(makePcmBase64(1600), Date.now());
 	await t.shutdown();
 	assert.ok(chunks.length >= 1);
 	assert.equal(chunks[0].speakerGuess, null);
@@ -237,9 +252,52 @@ test("plan 104-04: getSpeaker throwing doesn't break emission — speakerGuess f
 			throw new Error("tracker-exploded");
 		},
 	});
-	for (let i = 0; i < 10; i++) await t.ingestFrame(makePcmBase64(1600), Date.now());
+	for (let i = 0; i < 10; i++)
+		await t.ingestFrame(makePcmBase64(1600), Date.now());
 	await t.shutdown();
 	assert.ok(chunks.length >= 1);
 	assert.equal(chunks[0].speakerGuess, null);
 	assert.equal(chunks[0].text, "x");
+});
+
+test("shutdown drains earlier concurrent transcription before tail flush and releases only once", async () => {
+	let finish;
+	const pending = new Promise((resolve) => {
+		finish = resolve;
+	});
+	const chunks = [];
+	let releases = 0;
+	let transcriptions = 0;
+	const t = await createTranscriber({
+		modelPath: "/mock-only",
+		emitChunk: (chunk) => chunks.push(chunk),
+		initWhisperFn: async () => ({
+			transcribeData: () => ({
+				promise:
+					++transcriptions === 1
+						? pending
+						: Promise.resolve({ segments: [{ text: "tail" }] }),
+			}),
+			release: async () => {
+				releases++;
+			},
+		}),
+	});
+	const earlier = t.ingestFrame(makePcmBase64(16000), 1);
+	await t.ingestFrame(makePcmBase64(1600), 2);
+	const shutdown = t.shutdown();
+	const repeated = t.shutdown();
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(releases, 0);
+	assert.equal(transcriptions, 1, "tail waits for the earlier transcription");
+	await t.ingestFrame(makePcmBase64(16000), 3);
+	finish({ segments: [{ text: "earlier" }] });
+	await earlier;
+	await shutdown;
+	await repeated;
+	assert.deepEqual(
+		chunks.map((chunk) => chunk.text),
+		["earlier", "tail"],
+	);
+	assert.equal(releases, 1);
 });

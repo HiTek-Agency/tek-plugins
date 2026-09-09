@@ -17,7 +17,13 @@ import { mkdirSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
-export const PROFILE_DIR = join(homedir(), ".config", "tek", "meet", "chrome-profile");
+export const PROFILE_DIR = join(
+	homedir(),
+	".config",
+	"tek",
+	"meet",
+	"chrome-profile",
+);
 export const DEFAULT_EXTENSION_DIR = join(
 	homedir(),
 	".config",
@@ -33,7 +39,9 @@ export function getChromeExec() {
 	if (platform() === "darwin") {
 		return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 	}
-	throw new Error("Platform not supported — Tek Meet is macOS-only for MVP (see CONTEXT D-03).");
+	throw new Error(
+		"Platform not supported — Tek Meet is macOS-only for MVP (see CONTEXT D-03).",
+	);
 }
 
 /**
@@ -76,7 +84,12 @@ export async function spawnBotChrome({
 } = {}) {
 	if (_chromeProc && !_chromeProc.killed) {
 		logger.info?.("[meet] bot chrome already running; reusing");
-		return { pid: _chromeProc.pid, profileDir: profileDir ?? PROFILE_DIR, meetUrl, reused: true };
+		return {
+			pid: _chromeProc.pid,
+			profileDir: profileDir ?? PROFILE_DIR,
+			meetUrl,
+			reused: true,
+		};
 	}
 	const resolvedProfileDir = profileDir ?? PROFILE_DIR;
 	mkdirSync(resolvedProfileDir, { recursive: true });
@@ -87,44 +100,56 @@ export async function spawnBotChrome({
 		startUrl,
 	});
 	logger.info?.(`[meet] spawning bot chrome: ${exec}`);
-	_chromeProc = spawnFn(exec, args, { detached: false, stdio: "ignore" });
+	const proc = spawnFn(exec, args, { detached: false, stdio: "ignore" });
+	_chromeProc = proc;
 	if (typeof _chromeProc.on === "function") {
 		_chromeProc.on("exit", (code) => {
 			logger.info?.(`[meet] bot chrome exited (code=${code})`);
-			_chromeProc = null;
+			if (_chromeProc === proc) _chromeProc = null;
 		});
 	}
-	return { pid: _chromeProc.pid, profileDir: resolvedProfileDir, meetUrl, reused: false };
+	return {
+		pid: _chromeProc.pid,
+		profileDir: resolvedProfileDir,
+		meetUrl,
+		reused: false,
+	};
 }
 
 export async function stopBotChrome() {
 	if (!_chromeProc) return { stopped: false, reason: "not-running" };
 	const proc = _chromeProc;
-	try {
-		proc.kill("SIGTERM");
-	} catch {
-		// ignore
-	}
 	const result = await new Promise((resolve) => {
-		const t = setTimeout(() => {
+		let forced = false;
+		const exited = () => {
+			clearTimeout(timer);
+			resolve({ stopped: true, forced });
+		};
+		const timer = setTimeout(() => {
+			forced = true;
 			try {
 				proc.kill("SIGKILL");
 			} catch {
-				// ignore
+				/* report unconfirmed below */
 			}
-			resolve({ stopped: true, forced: true });
-		}, 5000);
-		if (typeof proc.once === "function") {
-			proc.once("exit", () => {
-				clearTimeout(t);
-				resolve({ stopped: true, forced: false });
+			// Signal delivery is not proof of exit. Retain the handle so a
+			// retry can stop it; a later exit callback clears only this process.
+			resolve({
+				stopped: false,
+				forced: true,
+				reason: "termination-unconfirmed",
 			});
-		} else {
-			clearTimeout(t);
-			resolve({ stopped: true, forced: false });
+		}, 5000);
+		// Register before kill: a fast (or synchronously mocked) exit must not
+		// get missed and then look like an unconfirmed forced termination.
+		proc.once?.("exit", exited);
+		try {
+			proc.kill("SIGTERM");
+		} catch {
+			/* timeout reports unconfirmed */
 		}
 	});
-	_chromeProc = null;
+	if (result.stopped && _chromeProc === proc) _chromeProc = null;
 	return result;
 }
 

@@ -1,13 +1,18 @@
 import { test } from "node:test";
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import {
 	buildChromeArgs,
 	spawnBotChrome,
+	stopBotChrome,
 	_resetForTests,
 } from "../src/chrome-profile.js";
 
 test("buildChromeArgs includes --user-data-dir + --load-extension + about:blank", () => {
-	const argv = buildChromeArgs({ profileDir: "/tmp/test-profile", extensionDir: "/tmp/test-ext" });
+	const argv = buildChromeArgs({
+		profileDir: "/tmp/test-profile",
+		extensionDir: "/tmp/test-ext",
+	});
 	assert.ok(argv.some((a) => a === "--user-data-dir=/tmp/test-profile"));
 	assert.ok(argv.some((a) => a === "--load-extension=/tmp/test-ext"));
 	assert.ok(argv.includes("about:blank"), "must open about:blank first");
@@ -50,7 +55,13 @@ test("spawnBotChrome reuses existing process on second call", async () => {
 	let spawnCount = 0;
 	const fakeSpawn = () => {
 		spawnCount++;
-		return { pid: 42, killed: false, on: () => {}, once: () => {}, kill: () => {} };
+		return {
+			pid: 42,
+			killed: false,
+			on: () => {},
+			once: () => {},
+			kill: () => {},
+		};
 	};
 	await spawnBotChrome({
 		meetUrl: "x",
@@ -68,4 +79,68 @@ test("spawnBotChrome reuses existing process on second call", async () => {
 	});
 	assert.equal(spawnCount, 1, "spawnFn should only be called once");
 	assert.equal(r2.reused, true);
+});
+
+function fakeProcess(pid) {
+	const proc = new EventEmitter();
+	proc.pid = pid;
+	proc.killed = false;
+	proc.signals = [];
+	proc.kill = (signal) => {
+		proc.killed = true;
+		proc.signals.push(signal);
+		return true;
+	};
+	return proc;
+}
+const fakeOptions = (proc) => ({
+	spawnFn: () => proc,
+	logger: { info() {} },
+	profileDir: "/tmp/meet-owned-process-test",
+	extensionDir: "/tmp/meet-mock-extension",
+});
+
+test("a synchronous process exit during SIGTERM is observed and confirmed", async () => {
+	_resetForTests();
+	const proc = fakeProcess(1);
+	proc.kill = () => {
+		proc.emit("exit", 0);
+		return true;
+	};
+	await spawnBotChrome(fakeOptions(proc));
+	assert.deepEqual(await stopBotChrome(), { stopped: true, forced: false });
+	assert.equal((await stopBotChrome()).reason, "not-running");
+});
+
+test("unconfirmed forced termination retains handle; late old exit cannot clear a replacement", async (t) => {
+	_resetForTests();
+	t.mock.timers.enable({ apis: ["setTimeout"] });
+	const old = fakeProcess(1);
+	await spawnBotChrome(fakeOptions(old));
+	const stopping = stopBotChrome();
+	assert.deepEqual(old.signals, ["SIGTERM"]);
+	t.mock.timers.tick(5000);
+	assert.deepEqual(await stopping, {
+		stopped: false,
+		forced: true,
+		reason: "termination-unconfirmed",
+	});
+	const retry = stopBotChrome();
+	assert.deepEqual(
+		old.signals,
+		["SIGTERM", "SIGKILL", "SIGTERM"],
+		"unconfirmed process remains reachable for explicit retry",
+	);
+	const replacement = fakeProcess(2);
+	await spawnBotChrome(fakeOptions(replacement));
+	old.emit("exit", 0);
+	assert.equal((await retry).stopped, true);
+	const reused = await spawnBotChrome(fakeOptions(fakeProcess(3)));
+	assert.equal(
+		reused.pid,
+		2,
+		"old exit and stop completion cannot clear replacement handle",
+	);
+	assert.equal(reused.reused, true);
+	_resetForTests();
 });

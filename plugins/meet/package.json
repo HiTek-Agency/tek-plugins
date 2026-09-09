@@ -1,12 +1,12 @@
 {
 	"name": "@tek-plugins/meet",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"type": "module",
 	"main": "src/index.js",
 	"dependencies": {
 		"ws": "^8.18.0"
 	},
 	"scripts": {
-		"test": "node --test 'test/**/*.test.js' 'test/**/*.test.mjs'"
+		"test": "node --experimental-test-module-mocks --test 'test/**/*.test.js' 'test/**/*.test.mjs'"
 	}
 }
