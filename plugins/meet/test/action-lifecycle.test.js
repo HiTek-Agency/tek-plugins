@@ -826,3 +826,42 @@ test("owned capture recovery reports starting until a fresh active acknowledgeme
 	});
 	assert.deepEqual((await status()).capture, { state: "active" });
 });
+
+test("audio ingestion requires confirmed active capture while accepted chunks still drain on stop", async () => {
+	const control = connect();
+	await join();
+	const audio = connect("audio");
+	const frame = () =>
+		audio.message({
+			kind: "meet.audio.frame",
+			meetingId: "abc-defg-hij",
+			frame: "owned",
+			t: 1,
+		});
+	frame();
+	for (const state of ["starting", "needs-user", "failed", "stopped"]) {
+		control.message({
+			kind: "meet.capture.state",
+			meetingId: "abc-defg-hij",
+			state,
+		});
+		frame();
+	}
+	assert.equal(state.transcribers[0].frames.length, 1);
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "abc-defg-hij",
+		state: "active",
+	});
+	frame();
+	assert.equal(state.transcribers[0].frames.length, 2);
+	control.close();
+	assert.equal((await status()).capture.state, "unknown");
+	frame();
+	assert.equal(state.transcribers[0].frames.length, 2);
+	state.transcribers[0].shutdown = async () =>
+		state.transcriberOptions[0].emitChunk({ text: "already accepted tail" });
+	await kick();
+	assert.equal(state.chunks.length, 1);
+	assert.equal(state.chunks[0][0], "/mock-only/abc-defg-hij");
+});
