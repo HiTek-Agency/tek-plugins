@@ -1,3 +1,4 @@
+import { mountCapturePopup } from "./capture-popup.js";
 /**
  * Tek Meet — popup UI (Plan 104-02).
  *
@@ -33,11 +34,11 @@ async function render() {
 				if (typeof parsed.port !== "number" || typeof parsed.token !== "string") {
 					throw new Error("meta must have numeric port + string token");
 				}
-				await chrome.storage.local.set({ [STORAGE_KEY]: parsed });
-				await chrome.runtime.sendMessage({ kind: "update-meta", meta: parsed });
+				const result = await chrome.runtime.sendMessage({ kind: "update-meta", meta: parsed });
+				if (!result?.ok) throw new Error(result?.error ?? "Pairing change was not confirmed");
 				render();
 			} catch (e) {
-				statusEl.textContent = `Invalid JSON: ${e.message}`;
+				statusEl.textContent = `Pairing was not changed: ${e.message}`;
 			}
 		};
 		statusEl.after(input, saveBtn);
@@ -54,13 +55,16 @@ async function render() {
 }
 
 resetBtn.addEventListener("click", async () => {
-	await chrome.storage.local.remove(STORAGE_KEY);
 	try {
-		await chrome.runtime.sendMessage({ kind: "reset" });
+		const result = await chrome.runtime.sendMessage({ kind: "reset" });
+		if (!result?.ok) { statusEl.textContent = result?.error ?? "Reset could not be confirmed."; return; }
 	} catch {
-		// ignore — SW may be asleep
+		statusEl.textContent = "Reset could not be confirmed. Check audio status before retrying.";
+		return;
 	}
 	render();
 });
 
 render();
+
+mountCapturePopup(document, chrome);

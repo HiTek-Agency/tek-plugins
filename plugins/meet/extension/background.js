@@ -16,6 +16,8 @@
 
 import { dispatch } from "./dispatch.js";
 import { openBotSignin } from "./open-signin.js";
+import { observeCaptureTarget } from "./capture-guards.js";
+import { createCaptureController } from "./capture-controller.js";
 import { runKeepaliveCycle, KEEPALIVE_INTERVAL_MS } from "./keepalive.js";
 import { buildChatPostCommands, buildTransparencyText } from "./chat-post.js";
 
@@ -27,6 +29,10 @@ const KEEPALIVE_ALARM = "tek-meet-keepalive";
 let ws = null;
 let backoff = 1000;
 let connected = false;
+let connectionRevision = 0;
+let reconnectTimer = null;
+let pairingChangeInFlight = false;
+let metaWriteTail = Promise.resolve();
 
 // Plan 104-03: tabCapture + offscreen-doc lifecycle state.
 // currentMeetingTabId survives SW restarts via chrome.storage? — NO, we rely
@@ -41,8 +47,13 @@ async function loadMeta() {
 	return r[STORAGE_KEY] || null;
 }
 
-async function saveMeta(meta) {
-	await chrome.storage.local.set({ [STORAGE_KEY]: meta });
+function mutateMeta(write) {
+	const operation = metaWriteTail.catch(() => {}).then(write);
+	metaWriteTail = operation;
+	return operation;
+}
+function saveMeta(meta) {
+	return mutateMeta(() => chrome.storage.local.set({ [STORAGE_KEY]: meta }));
 }
 
 function parseChromeVersion() {
@@ -50,14 +61,28 @@ function parseChromeVersion() {
 	return m ? m[1] : "unknown";
 }
 
-function scheduleReconnect(meta) {
+function scheduleReconnect(meta, revision) {
+	if (revision !== connectionRevision) return;
 	const delay = Math.min(backoff, 30_000);
-	setTimeout(() => connect(meta), delay);
+	clearTimeout(reconnectTimer);
+	reconnectTimer = setTimeout(() => { if (revision === connectionRevision) connect(meta); }, delay);
 	backoff = Math.min(backoff * 2, 30_000);
+}
+
+function disconnectTransport() {
+	++connectionRevision;
+	clearTimeout(reconnectTimer);
+	connected = false;
+	const previous = ws;
+	ws = null;
+	try { previous?.close(); } catch { /* Already closed. */ }
 }
 
 function connect(meta) {
 	if (!meta?.port || !meta?.token) return;
+	const revision = ++connectionRevision;
+	clearTimeout(reconnectTimer);
+	connected = false;
 	if (ws) {
 		try {
 			ws.close();
@@ -69,10 +94,13 @@ function connect(meta) {
 		ws = new WebSocket(`ws://127.0.0.1:${meta.port}?token=${meta.token}`);
 	} catch (e) {
 		console.error("[tek-meet] WS construction failed", e);
-		scheduleReconnect(meta);
+		scheduleReconnect(meta, revision);
 		return;
 	}
-	ws.addEventListener("open", () => {
+	const socket = ws;
+	const current = () => revision === connectionRevision && ws === socket;
+	socket.addEventListener("open", () => {
+		if (!current()) return;
 		console.log("[tek-meet] WS open");
 		ws.send(
 			JSON.stringify({
@@ -82,7 +110,8 @@ function connect(meta) {
 			}),
 		);
 	});
-	ws.addEventListener("message", async (e) => {
+	socket.addEventListener("message", async (e) => {
+		if (!current()) return;
 		let msg;
 		try {
 			msg = JSON.parse(e.data);
@@ -93,6 +122,7 @@ function connect(meta) {
 			connected = true;
 			backoff = 1000;
 			await saveMeta({ ...meta, connected: true, lastHandshakeAt: Date.now() });
+			if (!current()) return;
 			return;
 		}
 		// Plan 104-04: intercept specific tool calls BEFORE the pure
@@ -101,12 +131,20 @@ function connect(meta) {
 		// that needs chrome.tabs or chrome.debugger lives here instead.
 		if (msg.kind === "call" && typeof msg.tool === "string") {
 			const sendResult = (payload) => {
+				if (!current()) return;
 				try {
-					ws.send(JSON.stringify({ kind: "result", id: msg.id, ...payload }));
+					socket.send(JSON.stringify({ kind: "result", id: msg.id, ...payload }));
 				} catch (err) {
 					console.warn("[tek-meet] WS send failed", err);
 				}
 			};
+			if (msg.tool === "meet.start-capture" || msg.tool === "meet.stop-capture") {
+				const result = msg.tool === "meet.start-capture"
+					? await capture.start(msg.args)
+					: await capture.stop(msg.args);
+				sendResult({ value: result });
+				return;
+			}
 			if (msg.tool === "meet.open-signin") {
 				try {
 					const r = await openBotSignin(msg.args, chrome);
@@ -181,6 +219,7 @@ function connect(meta) {
 			}
 		}
 		await dispatch(msg, (out) => {
+			if (!current()) return;
 			try {
 				ws.send(JSON.stringify(out));
 			} catch (err) {
@@ -188,19 +227,25 @@ function connect(meta) {
 			}
 		});
 	});
-	ws.addEventListener("close", () => {
+	socket.addEventListener("close", () => {
+		if (!current()) return;
 		connected = false;
 		console.log("[tek-meet] WS closed");
-		scheduleReconnect(meta);
+		// Lost control ownership cannot authorize continued or restarted audio.
+		void capture.stop();
+		scheduleReconnect(meta, revision);
 	});
-	ws.addEventListener("error", (e) => {
+	socket.addEventListener("error", (e) => {
+		if (!current()) return;
 		console.warn("[tek-meet] WS error", e);
 	});
 }
 
 // Bootstrap: if pairing info is already saved, connect immediately.
 (async () => {
+	const revision = connectionRevision;
 	const meta = await loadMeta();
+	if (revision !== connectionRevision || pairingChangeInFlight) return;
 	if (meta?.port && meta?.token) {
 		connect(meta);
 	} else {
@@ -212,28 +257,30 @@ function connect(meta) {
 // SW stores and (re)connects with a fresh backoff.
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 	if (!msg || typeof msg !== "object") return;
-	if (msg.kind === "update-meta" && msg.meta) {
-		saveMeta(msg.meta)
-			.then(() => {
+	if ((msg.kind === "update-meta" && msg.meta) || msg.kind === "reset") {
+		if (_sender?.url !== chrome.runtime.getURL("popup.html")) {
+			sendResponse({ok:false,error:"Open the Tek Meet popup to change pairing."});
+			return false;
+		}
+		if (pairingChangeInFlight) { sendResponse({ok:false,error:"Another pairing change is still in progress."}); return false; }
+		pairingChangeInFlight = true;
+		// Detach the old control owner before awaiting media cleanup. A queued
+		// close/message from it cannot restart transport or capture afterward.
+		disconnectTransport();
+		const revision = connectionRevision;
+		(async () => {
+			const result = await capture.stop();
+			if (!result.ok) { sendResponse(result); return; }
+			if (revision !== connectionRevision) { sendResponse({ok:false,error:"Pairing changed while this request was pending."}); return; }
+			if (msg.kind === "reset") await mutateMeta(() => chrome.storage.local.remove(STORAGE_KEY));
+			else {
+				await saveMeta(msg.meta);
+				if (revision !== connectionRevision) { sendResponse({ok:false,error:"Pairing changed while this request was pending."}); return; }
 				backoff = 1000;
 				connect(msg.meta);
-				sendResponse({ ok: true });
-			})
-			.catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
-		return true;
-	}
-	if (msg.kind === "reset") {
-		chrome.storage.local
-			.remove(STORAGE_KEY)
-			.then(() => {
-				try {
-					if (ws) ws.close();
-				} catch {
-					// ignore
-				}
-				sendResponse({ ok: true });
-			})
-			.catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+			}
+			sendResponse({ok:true});
+		})().catch(() => sendResponse({ok:false,error:"Pairing could not be changed. Check audio status before retrying."})).finally(() => { pairingChangeInFlight = false; });
 		return true;
 	}
 	if (msg.kind === "status") {
@@ -246,7 +293,9 @@ chrome.runtime.onInstalled.addListener(() => {
 	console.log("[tek-meet] SW installed");
 });
 chrome.runtime.onStartup.addListener(async () => {
+	const revision = connectionRevision;
 	const meta = await loadMeta();
+	if (revision !== connectionRevision || pairingChangeInFlight) return;
 	if (meta?.port && meta?.token) connect(meta);
 });
 
@@ -267,10 +316,10 @@ async function hasOffscreenDoc() {
 			});
 			return Array.isArray(contexts) && contexts.length > 0;
 		} catch {
-			return false;
+			throw new Error("Offscreen status unavailable");
 		}
 	}
-	return false;
+	throw new Error("Offscreen status unavailable");
 }
 
 async function ensureOffscreen() {
@@ -282,92 +331,50 @@ async function ensureOffscreen() {
 	});
 }
 
-async function startMeetCapture({ tabId, meetingId }) {
-	currentMeetingTabId = tabId;
-	currentMeetingId = meetingId;
-	// chrome.tabCapture.getMediaStreamId is ONLY callable from the SW
-	// (or the owner tab's content script) and must be resolved BEFORE the
-	// offscreen doc calls getUserMedia.
-	const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
-	await ensureOffscreen();
-	const meta = await loadMeta();
-	// Offscreen doc listens on chrome.runtime.onMessage. Response is the ack
-	// from startCapture().
-	const ack = await chrome.runtime.sendMessage({
-		kind: "start-capture",
-		streamId,
-		meetingId,
-		meta,
-	});
-	if (!ack?.ok) {
-		throw new Error(`offscreen start-capture failed: ${ack?.error || "no-ack"}`);
+function publishCaptureState(state) {
+	if (state.meetingId && ws?.readyState === 1) {
+		try { ws.send(JSON.stringify({ kind:"meet.capture.state", ...state })); } catch { /* Gateway status will remain unconfirmed. */ }
 	}
-	// chrome.alarms periodInMinutes minimum is normally 0.5 in production
-	// Chrome but the keepalive value is 25 s. Chrome honors smaller values
-	// only in unpacked / developer builds; the keepalive module guards the
-	// ping/pong timing independently so an over-slow alarm just extends
-	// the hibernation window — it doesn't corrupt state.
-	chrome.alarms.create(KEEPALIVE_ALARM, {
-		periodInMinutes: KEEPALIVE_INTERVAL_MS / 60_000,
-	});
-	return { ok: true, meetingId, streamId };
 }
+const capture = createCaptureController({
+	chromeApi: chrome, loadMeta, ensureOffscreen, hasOffscreen: hasOffscreenDoc,
+	alarmName: KEEPALIVE_ALARM, periodInMinutes: KEEPALIVE_INTERVAL_MS / 60_000,
+	onState: state => {
+		currentMeetingTabId = state.state === "active" ? state.tabId : null;
+		currentMeetingId = state.state === "active" ? state.meetingId : null;
+		publishCaptureState(state);
+	},
+});
 
-async function stopMeetCapture() {
-	try {
-		await chrome.runtime.sendMessage({ kind: "stop-capture" });
-	} catch {
-		// offscreen may already be gone
-	}
-	chrome.alarms.clear(KEEPALIVE_ALARM).catch(() => {});
-	try {
-		await chrome.offscreen.closeDocument();
-	} catch {
-		// ignore
-	}
-	currentMeetingTabId = null;
-	currentMeetingId = null;
-}
+observeCaptureTarget(chrome, capture);
 
-chrome.alarms.onAlarm.addListener(async (alarm) => {
-	if (alarm.name !== KEEPALIVE_ALARM) return;
+chrome.alarms.onAlarm.addListener(async alarm => {
+	if (alarm.name !== KEEPALIVE_ALARM || capture.snapshot().state !== "active") return;
 	await runKeepaliveCycle({
-		sendPing: () => chrome.runtime.sendMessage({ kind: "keepalive-ping" }),
-		recreate: async () => {
-			try {
-				await chrome.offscreen.closeDocument();
-			} catch {
-				// ignore — may already be gone
-			}
-			if (currentMeetingTabId != null && currentMeetingId != null) {
-				await startMeetCapture({
-					tabId: currentMeetingTabId,
-					meetingId: currentMeetingId,
-				});
-			}
-		},
+		sendPing: () => chrome.runtime.sendMessage({ kind:"keepalive-ping" }),
+		recreate: async () => { const result = await capture.recover(); if (!result.ok) throw new Error(result.error ?? "Capture recovery unavailable"); },
 	});
 });
 
-// Route inbound gateway-triggered capture starts through this handler.
-// The gateway calls _rpc("meet.start-capture", {tabId, meetingId}); the pure
-// dispatcher forwards unknown tools as { kind:"call", tool, args } — we
-// short-circuit "meet.start-capture" here before it reaches dispatch.js.
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-	if (!msg || typeof msg !== "object") return;
-	if (msg.kind === "meet.start-capture") {
-		startMeetCapture({ tabId: msg.tabId, meetingId: msg.meetingId })
-			.then((r) => sendResponse(r))
-			.catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
-		return true;
+// Opening the popup invokes the extension on the selected tab. Chrome still
+// enforces activeTab when getMediaStreamId runs; runtime messages do not grant it.
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+	if (!msg || !["meet.capture.status", "meet.start-capture", "meet.stop-capture"].includes(msg.kind)) return;
+	if (sender?.url !== chrome.runtime.getURL("popup.html")) {
+		sendResponse({ok:false,code:"MEET_CAPTURE_INVALID",error:"Open the Tek Meet popup to control audio capture."});
+		return false;
 	}
-	if (msg.kind === "meet.stop-capture") {
-		stopMeetCapture()
-			.then(() => sendResponse({ ok: true }))
-			.catch((e) => sendResponse({ ok: false, error: String(e?.message || e) }));
-		return true;
+	if (msg.kind === "meet.capture.status") { sendResponse(capture.snapshot()); return false; }
+	const requested = capture.snapshot();
+	if (msg.kind === "meet.start-capture" && (requested.tabId !== msg.tabId || requested.meetingId !== msg.meetingId)) {
+		sendResponse({ok:false,code:"MEET_CONFLICT",error:"The requested meeting changed. Refresh the popup."});
+		return false;
 	}
-	return undefined;
+	const operation = msg.kind === "meet.start-capture"
+		? capture.start({tabId:msg.tabId,meetingId:msg.meetingId})
+		: capture.stop({expectedMeetingId:msg.expectedMeetingId});
+	operation.then(sendResponse);
+	return true;
 });
 
 /* ---------- Plan 104-04: meet.navigate (CDP) + meet.announce (CDP chat post) ---------- */

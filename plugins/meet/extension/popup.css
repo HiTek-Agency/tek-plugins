@@ -3,7 +3,7 @@
 	--fg: #e2e8f0;
 	--muted: #94a3b8;
 	--border: #1e293b;
-	--accent: #3b82f6;
+	--accent: #2563eb;
 	--ok: #10b981;
 	--warn: #f59e0b;
 	--err: #ef4444;
@@ -160,3 +160,11 @@ footer {
 	padding-top: 4px;
 	border-top: 1px solid var(--border);
 }
+
+.capture-panel { margin-top: 16px; border-top: 1px solid #64748b66; padding-top: 12px; }
+.capture-panel h2 { margin: 0 0 8px; font-size: 13px; }
+.capture-panel p { line-height: 1.5; overflow-wrap: anywhere; }
+.capture-actions { display: flex; gap: 8px; }
+.capture-actions button { flex: 1; }
+.capture-actions button:disabled { opacity: .5; cursor: default; }
+#capture-message:empty { display: none; }
