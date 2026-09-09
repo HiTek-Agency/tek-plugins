@@ -1,3 +1,5 @@
+import { createActionEpoch } from "./action-epoch.js";
+import { decodePairing } from "./pairing.js";
 import { navigateTab } from "./navigation.js";
 /**
  * Tek Chrome Control — background service worker (MV3).
@@ -25,6 +27,8 @@ import {
 
 const OFFSCREEN_URL = "offscreen.html";
 const CONTROL_POLICY_KEY = "controlPolicy";
+const actionEpoch = createActionEpoch();
+const sendForAction = (args,target,method,params) => actionEpoch.run(args,()=>chrome.debugger.sendCommand(target,method,params));
 
 async function loadControlPolicy() {
 	const stored = await chrome.storage.local.get([CONTROL_POLICY_KEY]);
@@ -126,16 +130,20 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 const attached = new Map(); // tabId -> { domains: string[] }
 
-async function ensureAttached(tabId) {
+async function ensureAttached(tabId, args) {
+	actionEpoch.assert(args);
+	const policy = await loadControlPolicy();
+	if (policy.paused || !isTabAllowed(policy, tabId)) throw new Error("Chrome control was paused or this tab was revoked.");
 	if (attached.has(tabId)) return;
 	await chrome.debugger.attach({ tabId }, "1.3");
+	try { actionEpoch.assert(args); } catch(error) { await chrome.debugger.detach({tabId}).catch(()=>{}); throw error; }
 	const target = { tabId };
-	await chrome.debugger.sendCommand(target, "Page.enable");
-	await chrome.debugger.sendCommand(target, "DOM.enable");
-	await chrome.debugger.sendCommand(target, "Runtime.enable");
-	await chrome.debugger.sendCommand(target, "Accessibility.enable");
+	await sendForAction(args, target, "Page.enable");
+	await sendForAction(args, target, "DOM.enable");
+	await sendForAction(args, target, "Runtime.enable");
+	await sendForAction(args, target, "Accessibility.enable");
 	try {
-		await chrome.debugger.sendCommand(target, "Target.setAutoAttach", {
+		await sendForAction(args, target, "Target.setAutoAttach", {
 			autoAttach: true,
 			waitForDebuggerOnStart: false,
 			flatten: true,
@@ -146,7 +154,7 @@ async function ensureAttached(tabId) {
 	}
 	// Input domain is required for dispatchMouseEvent / insertText / dispatchKeyEvent
 	try {
-		await chrome.debugger.sendCommand(target, "Input.enable");
+		await sendForAction(args, target, "Input.enable");
 	} catch {
 		// Input.enable may not exist in all protocol versions; commands still work.
 	}
@@ -235,13 +243,13 @@ async function capturePageState(tabId, args = {}, includeText = false) {
 	const settleMs = args.settleMs ?? 250;
 	if (settleMs > 0) await new Promise((r) => setTimeout(r, settleMs));
 	const target = { tabId };
-	const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+	const ax = await sendForAction(args, target, "Accessibility.getFullAXTree", {});
 	// Normalize all nodes in extension memory. shapePageState applies the bounded
 	// response window, so full inspection can page past the old first-100KB cap.
 	const normalized = pruneAxTree(ax?.nodes || [], { maxBytes: Number.POSITIVE_INFINITY });
 	let text = "";
 	if (includeText) {
-		const evalRes = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+		const evalRes = await sendForAction(args, target, "Runtime.evaluate", {
 			expression: "document.body ? document.body.innerText : ''",
 			returnByValue: true,
 		});
@@ -278,6 +286,7 @@ async function resolveTabId(args) {
 }
 
 async function dispatchToolCall(tool, args = {}) {
+	args = actionEpoch.capture(args);
 	if (tool === "control_status") return TOOL_HANDLERS.control_status(args);
 	if (tool === "tabs_list") return TOOL_HANDLERS.tabs_list(args);
 
@@ -285,6 +294,7 @@ async function dispatchToolCall(tool, args = {}) {
 	if (policy.paused) {
 		throw new Error("Chrome control is paused by the user. Ask them to resume it in the Tek extension.");
 	}
+	actionEpoch.assert(args);
 	if (tool === "tabs_create") return TOOL_HANDLERS.tabs_create(args);
 
 	const tabId = await resolveTabId(args);
@@ -293,6 +303,7 @@ async function dispatchToolCall(tool, args = {}) {
 			`Chrome tab ${tabId} is not granted to Tek. The user must allow this tab in the Tek extension.`,
 		);
 	}
+	actionEpoch.assert(args);
 	return TOOL_HANDLERS[tool]({ ...args, tabId });
 }
 
@@ -300,7 +311,7 @@ async function resolveBackendDOMNodeId(target, args) {
 	if (Number.isInteger(args.backendDOMNodeId)) return args.backendDOMNodeId;
 	if (args.axNodeId == null) return null;
 
-	const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+	const ax = await sendForAction(args, target, "Accessibility.getFullAXTree", {});
 	const node = (ax?.nodes || []).find((candidate) => String(candidate.nodeId) === String(args.axNodeId));
 	if (Number.isInteger(node?.backendDOMNodeId)) return node.backendDOMNodeId;
 
@@ -335,30 +346,33 @@ const TOOL_HANDLERS = {
 				controllable: !policy.paused,
 			}));
 	},
-	tabs_create: async ({ url, active = true } = {}) => {
+	tabs_create: async (args = {}) => {
+		const {url,active=true} = args;
 		if (typeof url !== "string") throw new Error("url required");
-		const tab = await chrome.tabs.create({ url, active });
-		await saveControlPolicy(grantTab(await loadControlPolicy(), tab.id));
+		const tab = await actionEpoch.run(args,()=>chrome.tabs.create({ url, active }));
+		const policy = await loadControlPolicy(); actionEpoch.assert(args);
+		await saveControlPolicy(grantTab(policy, tab.id));
 		return { id: tab.id, url: tab.url, windowId: tab.windowId };
 	},
 	navigate: async (args = {}) => {
 		const tabId = await resolveTabId(args);
 		if (typeof args.url !== "string") throw new Error("url required");
+		actionEpoch.assert(args);
 		const tab = await navigateTab(chrome.tabs, tabId, args.url);
 		return { tabId, url: tab.url, title: tab.title };
 	},
 	read_page: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		return capturePageState(tabId, { ...args, settleMs: 0 }, true);
 	},
 	find: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		const target = { tabId };
 		let matches = [];
 		if (typeof args.selector === "string" && args.selector.length > 0) {
-			const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+			const { result } = await sendForAction(args, target, "Runtime.evaluate", {
 				expression: `(() => {
 					const els = document.querySelectorAll(${JSON.stringify(args.selector)});
 					return Array.from(els).slice(0, 50).map((el) => {
@@ -376,7 +390,7 @@ const TOOL_HANDLERS = {
 			matches = result?.value ?? [];
 		} else {
 			// Query mode: walk AX tree for name substring + optional role filter
-			const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+			const ax = await sendForAction(args, target, "Accessibility.getFullAXTree", {});
 			const q = String(args.query || "").toLowerCase();
 			const roleFilter = args.role;
 			matches = (ax?.nodes || [])
@@ -414,7 +428,7 @@ const TOOL_HANDLERS = {
 			else if (only.axNodeId != null) clickArgs.axNodeId = only.axNodeId;
 			else if (typeof args.selector === "string") clickArgs.selector = args.selector;
 			const clickRes = await TOOL_HANDLERS.click({
-				...clickArgs,
+				...actionEpoch.inherit(args,clickArgs),
 				pageMode: resolvePageMode(args),
 			});
 			return { matches, clicked: clickRes };
@@ -425,7 +439,7 @@ const TOOL_HANDLERS = {
 
 	click: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		const target = { tabId };
 		let box;
 		if (args.axNodeId != null || args.backendDOMNodeId != null) {
@@ -434,10 +448,10 @@ const TOOL_HANDLERS = {
 				if (!Number.isInteger(backendNodeId)) {
 					return { ok: false, reason: "accessibility-node-has-no-dom-target" };
 				}
-				const { object } = await chrome.debugger.sendCommand(target, "DOM.resolveNode", {
+				const { object } = await sendForAction(args, target, "DOM.resolveNode", {
 					backendNodeId,
 				});
-				const { model } = await chrome.debugger.sendCommand(target, "DOM.getBoxModel", {
+				const { model } = await sendForAction(args, target, "DOM.getBoxModel", {
 					objectId: object.objectId,
 				});
 				const c = model.content;
@@ -446,7 +460,7 @@ const TOOL_HANDLERS = {
 				return { ok: false, reason: `accessibility-node-resolve-failed: ${e?.message ?? e}` };
 			}
 		} else if (typeof args.selector === "string") {
-			const { result } = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+			const { result } = await sendForAction(args, target, "Runtime.evaluate", {
 				expression: `(() => {
 					const el = document.querySelector(${JSON.stringify(args.selector)});
 					if (!el) return null;
@@ -461,19 +475,19 @@ const TOOL_HANDLERS = {
 		} else {
 			return { ok: false, reason: "selector-or-accessibility-node-required" };
 		}
-		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+		await sendForAction(args, target, "Input.dispatchMouseEvent", {
 			type: "mouseMoved",
 			x: box.x,
 			y: box.y,
 		});
-		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+		await sendForAction(args, target, "Input.dispatchMouseEvent", {
 			type: "mousePressed",
 			x: box.x,
 			y: box.y,
 			button: "left",
 			clickCount: 1,
 		});
-		await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", {
+		await sendForAction(args, target, "Input.dispatchMouseEvent", {
 			type: "mouseReleased",
 			x: box.x,
 			y: box.y,
@@ -494,7 +508,7 @@ const TOOL_HANDLERS = {
 
 	form_input: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		const target = { tabId };
 		if (typeof args.text !== "string") return { ok: false, reason: "text-required" };
 		// Focus element first via click — skip its page capture; we'll do one at the end.
@@ -503,14 +517,14 @@ const TOOL_HANDLERS = {
 		if (args.clear) {
 			// Best-effort select-all + delete
 			try {
-				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+				await sendForAction(args, target, "Input.dispatchKeyEvent", {
 					type: "keyDown",
 					modifiers: 4, // Meta on mac, Ctrl on others — 4 maps to Ctrl
 					windowsVirtualKeyCode: 65, // 'A'
 					key: "a",
 					commands: ["selectAll"],
 				});
-				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+				await sendForAction(args, target, "Input.dispatchKeyEvent", {
 					type: "keyDown",
 					windowsVirtualKeyCode: 46, // Delete
 					key: "Delete",
@@ -519,15 +533,15 @@ const TOOL_HANDLERS = {
 				// clear is best-effort; continue with insert
 			}
 		}
-		await chrome.debugger.sendCommand(target, "Input.insertText", { text: args.text });
+		await sendForAction(args, target, "Input.insertText", { text: args.text });
 		if (args.pressEnter) {
 			try {
-				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+				await sendForAction(args, target, "Input.dispatchKeyEvent", {
 					type: "keyDown",
 					windowsVirtualKeyCode: 13,
 					key: "Enter",
 				});
-				await chrome.debugger.sendCommand(target, "Input.dispatchKeyEvent", {
+				await sendForAction(args, target, "Input.dispatchKeyEvent", {
 					type: "keyUp",
 					windowsVirtualKeyCode: 13,
 					key: "Enter",
@@ -549,7 +563,7 @@ const TOOL_HANDLERS = {
 
 	form_fill: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		if (!Array.isArray(args.fields) || args.fields.length === 0) {
 			return { ok: false, reason: "fields-required" };
 		}
@@ -557,6 +571,7 @@ const TOOL_HANDLERS = {
 		for (let i = 0; i < args.fields.length; i++) {
 			const f = args.fields[i] || {};
 			const r = await TOOL_HANDLERS.form_input({
+				...actionEpoch.inherit(args),
 				tabId,
 				selector: f.selector,
 				axNodeId: f.axNodeId,
@@ -582,7 +597,7 @@ const TOOL_HANDLERS = {
 		// Optionally click a submit button after the last field.
 		let submitted;
 		if (args.submit) {
-			const submitArgs = { tabId, returnPage: false };
+			const submitArgs = actionEpoch.inherit(args,{ tabId, returnPage: false });
 			if (typeof args.submit === "object") {
 				if (args.submit.axNodeId != null) submitArgs.axNodeId = args.submit.axNodeId;
 				if (args.submit.backendDOMNodeId != null) {
@@ -610,7 +625,7 @@ const TOOL_HANDLERS = {
 
 	wait_for: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		const target = { tabId };
 		const timeoutMs = Math.min(Math.max(Number(args.timeout) || 5000, 100), 30000);
 		const wantHidden = args.hidden === true;
@@ -643,7 +658,7 @@ const TOOL_HANDLERS = {
 				obs.observe(document.documentElement, { subtree: true, childList: true, attributes: true });
 				setTimeout(() => { obs.disconnect(); resolve({ ok: false, reason: "timeout" }); }, ${timeoutMs});
 			})`;
-			const res = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+			const res = await sendForAction(args, target, "Runtime.evaluate", {
 				expression,
 				returnByValue: true,
 				awaitPromise: true,
@@ -670,7 +685,7 @@ const TOOL_HANDLERS = {
 				obs.observe(document.documentElement, { subtree: true, childList: true, characterData: true });
 				setTimeout(() => { obs.disconnect(); resolve({ ok: false, reason: "timeout" }); }, ${timeoutMs});
 			})`;
-			const res = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+			const res = await sendForAction(args, target, "Runtime.evaluate", {
 				expression,
 				returnByValue: true,
 				awaitPromise: true,
@@ -684,7 +699,7 @@ const TOOL_HANDLERS = {
 			const roleFilter = args.role;
 			const start = Date.now();
 			while (Date.now() - start < timeoutMs) {
-				const ax = await chrome.debugger.sendCommand(target, "Accessibility.getFullAXTree", {});
+				const ax = await sendForAction(args, target, "Accessibility.getFullAXTree", {});
 				const found = (ax?.nodes || []).find((n) => {
 					const nameValue = (n.name?.value || "").toLowerCase();
 					if (roleFilter && n.role?.value !== roleFilter) return false;
@@ -712,7 +727,7 @@ const TOOL_HANDLERS = {
 
 	screenshot: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		// CDP captureScreenshot runs in SW; OffscreenCanvas isn't available here, so
 		// forward raw base64 to offscreen doc for downscaling.
 		const { data } = await chrome.debugger.sendCommand({ tabId }, "Page.captureScreenshot", {
@@ -742,7 +757,7 @@ const TOOL_HANDLERS = {
 
 	javascript_tool: async (args = {}) => {
 		const tabId = await resolveTabId(args);
-		await ensureAttached(tabId);
+		await ensureAttached(tabId, args);
 		const target = { tabId };
 		if (typeof args.expression !== "string") {
 			return { error: { name: "ArgError", message: "expression required", stack: "" } };
@@ -756,7 +771,7 @@ const TOOL_HANDLERS = {
 		if (typeof contextId === "number") params.contextId = contextId;
 		let res;
 		try {
-			res = await chrome.debugger.sendCommand(target, "Runtime.evaluate", params);
+			res = await sendForAction(args, target, "Runtime.evaluate", params);
 		} catch (e) {
 			return {
 				error: {
@@ -817,6 +832,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		return true;
 	}
 	if (msg.kind === "revoke-active-tab") {
+		actionEpoch.invalidate();
 		Promise.all([loadControlPolicy(), activeTab()])
 			.then(async ([policy, tab]) => {
 				if (!tab?.id) throw new Error("No active Chrome tab");
@@ -832,10 +848,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		return true;
 	}
 	if (msg.kind === "set-control-paused" && typeof msg.paused === "boolean") {
+		actionEpoch.invalidate();
 		loadControlPolicy()
 			.then(async (policy) => {
-				if (msg.paused) await detachAllDebugSessions();
 				await saveControlPolicy(setControlPaused(policy, msg.paused));
+				if (msg.paused) await detachAllDebugSessions();
 				return controlStatus();
 			})
 			.then((status) => sendResponse({ ok: true, ...status }))
@@ -860,8 +877,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		return true;
 	}
 	if (msg.kind === "set-token" && typeof msg.token === "string") {
+		actionEpoch.invalidate();
+		let pairing;
+		try { pairing = decodePairing(msg.token); } catch (error) { sendResponse({ ok: false, error: error.message }); return false; }
 		chrome.storage.local
-			.set({ auth: { token: msg.token } })
+			.set({ auth: { token: pairing.token }, wsPort: pairing.port })
 			.then(() => {
 				// Broadcast to offscreen so it can reconnect immediately.
 				try {
@@ -885,6 +905,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		return true;
 	}
 	if (msg.kind === "reset-auth") {
+		actionEpoch.invalidate();
 		Promise.all([chrome.storage.local.remove(["auth", "wsPort"]), loadControlPolicy()])
 			.then(async ([, policy]) => {
 				await detachAllDebugSessions();

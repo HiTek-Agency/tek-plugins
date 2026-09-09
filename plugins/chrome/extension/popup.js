@@ -157,9 +157,10 @@ saveBtn.addEventListener("click", async () => {
 	if (!token) return;
 	saveBtn.disabled = true;
 	try {
-		await chrome.runtime.sendMessage({ kind: "set-token", token });
+		const result = await chrome.runtime.sendMessage({ kind: "set-token", token });
+		if (!result?.ok) throw new Error(result?.error ?? "Pairing failed");
 	} catch (err) {
-		console.warn("[tek] set-token failed", err);
+		statusTextEl.textContent = err.message ?? "Pairing failed";
 	} finally {
 		setTimeout(() => {
 			saveBtn.disabled = false;

@@ -138,7 +138,7 @@ async function connect() {
 
 	socket.onopen = async () => {
 		if (ws !== socket) return;
-		console.log("[tek] WS open", url);
+		console.log("[tek] WS open");
 		let extensionId = null;
 		try {
 			extensionId = chrome?.runtime?.id ?? null;
@@ -151,7 +151,7 @@ async function connect() {
 			version: null,
 			chromeVersion: getChromeVersion(),
 			extensionId,
-			capabilities: ["tabs", "debugger", "scripting", "screenshot", "control-lease"],
+			capabilities: ["tabs", "debugger", "scripting", "screenshot", "control-lease", "client-pause"],
 		};
 		try {
 			const status = await chrome.runtime.sendMessage({ kind: "get-control-status" });
@@ -192,6 +192,10 @@ async function connect() {
 			return;
 		}
 		if (msg.kind === "pong") return;
+		if (msg.kind === "pause") {
+			await chrome.runtime.sendMessage({ kind: "set-control-paused", paused: true });
+			return;
+		}
 		if (msg.kind === "call") {
 			// Forward RPC call to SW for dispatch (plan 04/05 fill bodies)
 			try {
@@ -227,6 +231,7 @@ async function connect() {
 		if (ws !== socket) return;
 		console.log("[tek] WS close", event.code, event.reason);
 		ws = null;
+		void chrome.runtime.sendMessage({ kind: "set-control-paused", paused: true }).catch(() => {});
 		stopHeartbeat();
 		lastServerMessageAt = 0;
 		// 4401 = unauthorized (bad/missing token). Still reconnect — user may paste a new token.
