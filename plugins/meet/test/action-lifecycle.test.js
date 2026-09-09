@@ -19,7 +19,12 @@ class FakeServer extends EventEmitter {
 class FakeSocket extends EventEmitter {
 	calls = [];
 	closed = false;
-	reply = () => ({});
+	reply = (message) =>
+		message.tool === "meet.start-capture"
+			? { ok: true, meetingId: message.args.meetingId }
+			: message.tool === "meet.stop-capture"
+				? { ok: true }
+				: {};
 	send(raw) {
 		const message = JSON.parse(raw);
 		if (message.kind !== "call") return;
@@ -300,7 +305,9 @@ test("kick interrupts pending navigation and ignores late results before a new m
 test("kick interrupts transparency delay; no announce is sent after stop", async () => {
 	const control = connect();
 	control.reply = (message) =>
-		message.tool === "meet.navigate" ? { tabId: 7 } : {};
+		message.tool === "meet.navigate"
+			? { tabId: 7 }
+			: { ok: true, meetingId: "abc-defg-hij" };
 	const joining = join();
 	await turn();
 	assert.deepEqual(
@@ -604,4 +611,195 @@ test("connected sign-in uses only the fixed extension route, never broadens Meet
 		control.calls.map(({ tool, args }) => ({ tool, args })),
 		[{ tool: "meet.open-signin", args: {} }],
 	);
+});
+
+test("failed or missing capture acknowledgement never reports ready and never retries the join", async () => {
+	for (const response of [
+		{},
+		{ ok: true, meetingId: "another-meeting" },
+		{
+			ok: false,
+			code: "MEET_CAPTURE_USER_GESTURE_REQUIRED",
+			error: "Chrome needs extension invocation",
+		},
+	]) {
+		const control = connect();
+		const originalReply = control.reply;
+		control.reply = (message) =>
+			message.tool === "meet.start-capture" ? response : originalReply(message);
+		const result = await join();
+		assert.equal(result.ok, false);
+		assert.equal(
+			result.meetingId,
+			"abc-defg-hij",
+			"opened bot remains identifiable for Stop",
+		);
+		assert.equal(result.transcriptionReady, true);
+		assert.equal(result.capture.state, response.code ? "needs-user" : "failed");
+		assert.equal((await status()).capture.state, result.capture.state);
+		if (response.code)
+			assert.match(
+				result.guidance,
+				/open the Tek Meet extension, and click Start audio/,
+			);
+		assert.equal(
+			control.calls.filter((call) => call.tool === "meet.start-capture").length,
+			1,
+		);
+		assert.equal(
+			state.stops,
+			state.spawns.length - 1,
+			"capture failure does not silently stop/rejoin",
+		);
+		assert.equal((await join()).code, "MEET_BUSY");
+		await kick();
+	}
+});
+
+test("manual capture state requires the current control socket and exact meeting identity", async () => {
+	const control = connect();
+	control.reply = (message) =>
+		message.tool === "meet.start-capture"
+			? {
+					ok: false,
+					code: "MEET_CAPTURE_USER_GESTURE_REQUIRED",
+					error: "Permission required",
+				}
+			: {};
+	assert.equal((await join()).ok, false);
+	const audio = connect("audio");
+	audio.message({
+		kind: "meet.capture.state",
+		meetingId: "abc-defg-hij",
+		state: "active",
+	});
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "other-meeting",
+		state: "active",
+	});
+	control.message({ kind: "meet.capture.state", state: "active" });
+	assert.equal((await status()).capture.state, "needs-user");
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "abc-defg-hij",
+		state: "active",
+	});
+	assert.deepEqual((await status()).capture, { state: "active" });
+	assert.equal(
+		control.calls.filter((call) => call.tool === "meet.start-capture").length,
+		1,
+	);
+	control.close();
+	assert.equal(
+		(await status()).capture.state,
+		"unknown",
+		"disconnect does not leave an active claim",
+	);
+	await kick();
+	connect();
+	await join("new-room");
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "new-room",
+		state: "failed",
+	});
+	assert.equal((await status()).capture.state, "active");
+});
+
+test("newer manual capture evidence is not overwritten by a late RPC response", async () => {
+	const control = connect();
+	control.reply = (message) =>
+		message.tool === "meet.start-capture" ? undefined : {};
+	const joining = join();
+	await turn();
+	const request = control.calls.find(
+		(call) => call.tool === "meet.start-capture",
+	);
+	assert.equal((await status()).capture.state, "starting");
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "abc-defg-hij",
+		state: "active",
+	});
+	control.message({
+		kind: "result",
+		id: request.id,
+		value: {
+			ok: false,
+			code: "MEET_CAPTURE_USER_GESTURE_REQUIRED",
+			error: "older refusal",
+		},
+	});
+	assert.equal((await joining).ok, true);
+	assert.equal((await status()).capture.state, "active");
+});
+
+test("RPC error codes preserve actionable capture permission guidance", async () => {
+	const control = connect();
+	const originalSend = control.send.bind(control);
+	control.send = (raw) => {
+		const message = JSON.parse(raw);
+		if (message.tool !== "meet.start-capture") return originalSend(raw);
+		control.calls.push(message);
+		control.message({
+			kind: "result",
+			id: message.id,
+			error: "Chrome denied capture",
+			code: "MEET_CAPTURE_USER_GESTURE_REQUIRED",
+		});
+	};
+	const result = await join();
+	assert.equal(result.code, "MEET_CAPTURE_USER_GESTURE_REQUIRED");
+	assert.equal(result.capture.state, "needs-user");
+	assert.match(result.guidance, /Start audio/);
+});
+
+test("capture acknowledgement alone cannot claim local transcription is ready", async () => {
+	connect();
+	state.create = async () => {
+		throw new Error("Whisper model unavailable");
+	};
+	const result = await join();
+	assert.equal(result.ok, false);
+	assert.equal(result.capture.state, "active");
+	assert.equal(result.transcriptionReady, false);
+	assert.equal(result.code, "MEET_TRANSCRIBER_UNAVAILABLE");
+	assert.equal((await status()).transcriptionReady, false);
+	assert.match(
+		(await status()).transcriptionError,
+		/Whisper model unavailable/,
+	);
+});
+
+test("natural end requires conditional capture stop confirmation before releasing the meeting", async () => {
+	const control = connect();
+	await join();
+	const originalReply = control.reply;
+	control.reply = (message) =>
+		message.tool === "meet.stop-capture"
+			? { ok: false, error: "offscreen still active" }
+			: originalReply(message);
+	control.message({ kind: "meet.in-call-ended", meetingId: "abc-defg-hij" });
+	await turn();
+	assert.deepEqual(control.calls.at(-1).args, {
+		expectedMeetingId: "abc-defg-hij",
+	});
+	assert.equal((await status()).meetingId, "abc-defg-hij");
+	assert.equal((await status()).capture.state, "unknown");
+	assert.equal((await status()).capture.code, "MEET_CAPTURE_STOP_UNCONFIRMED");
+	assert.equal((await join("new-room")).code, "MEET_BUSY");
+	assert.equal(state.finalizes.length, 0);
+	await kick();
+	assert.equal((await status()).meetingId, null);
+});
+
+test("loss of the owned audio connection makes delivery unknown without replacing control ownership", async () => {
+	const control = connect();
+	await join();
+	const audio = connect("audio");
+	audio.close();
+	assert.equal((await status()).capture.state, "unknown");
+	assert.equal((await status()).connected, true);
+	assert.equal(plugin._getActiveSocket(), control);
 });

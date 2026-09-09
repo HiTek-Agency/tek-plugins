@@ -83,6 +83,37 @@ that never settles keeps new operations blocked; Chrome stop still starts
 immediately. An emergency kick preserves raw transcript chunks but does not
 implicitly create a Google Doc or start reconciliation.
 
+### Capture readiness and Chrome invocation
+
+Chrome permits tab capture only after the user invokes the extension for the
+target tab; opening Chrome through a Gateway request does not grant that
+permission. See [Chrome tabCapture documentation](https://developer.chrome.com/docs/extensions/reference/api/tabCapture).
+When Chrome denies the start request, focus the Meet tab in the dedicated bot
+Chrome profile, open the Tek Meet extension, and click **Start audio**. The popup
+can retry only the tab and meeting already requested by the Gateway. Stop clears
+that pending target; it cannot be silently reused for a different meeting.
+
+The join tool sends one capture request. It reports `ok: false` for a missing,
+failed, or wrong-meeting acknowledgement, and also when local Whisper setup is
+unavailable. The bot window may already be open in that case: the meeting remains
+identifiable so the user can explicitly stop it. The tool does not retry or claim
+that capture or transcription is ready merely because navigation succeeded.
+
+Status includes `capture: { state, error?, code? }`, where state is `idle`,
+`starting`, `active`, `needs-user`, `failed`, `stopped`, or `unknown`, and a separate
+`transcriptionReady` flag with optional `transcriptionError`. Only a successful
+capture acknowledgement or an owned extension state update establishes active
+capture. A matching manual recovery updates status without rerunning the join;
+late RPC responses cannot overwrite newer capture evidence. Connection loss
+makes previously active delivery unknown. Stop/failed-stop evidence takes
+precedence over capture readiness.
+
+A natural meeting end requests `meet.stop-capture` with the exact expected meeting
+ID before draining transcription and finalizing the archive. Unconfirmed capture
+cleanup keeps the meeting available for explicit emergency Stop and blocks a new
+join. These local protocol checks do not verify Google admission or real media
+permission; live acceptance remains separate.
+
 ### Updating an existing bot extension
 
 After updating the plugin to **0.1.1**, open `chrome://extensions` in the dedicated
