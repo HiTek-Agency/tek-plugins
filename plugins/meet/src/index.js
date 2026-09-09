@@ -1138,6 +1138,7 @@ export async function register(ctx) {
 			if (connection.role === "audio") {
 				if (
 					msg.kind === "meet.audio.frame" &&
+					_capture.state === "active" &&
 					_meetingId &&
 					msg.meetingId === _meetingId &&
 					_transcriber
