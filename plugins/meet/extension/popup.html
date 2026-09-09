@@ -10,7 +10,14 @@
 			<h1>Tek Meet</h1>
 			<div id="status">Loading...</div>
 			<button id="reset">Reset Connection</button>
+			<section class="capture-panel" aria-labelledby="capture-heading">
+				<h2 id="capture-heading">Meeting audio</h2>
+				<p id="capture-status" role="status">Checking audio…</p>
+				<p>Select the bot’s Meet tab, open Tek Meet, then click Start audio. Chrome must allow capture of that tab.</p>
+				<div class="capture-actions"><button id="capture-start" disabled>Start audio</button><button id="capture-stop" disabled>Stop audio</button></div>
+				<p id="capture-message" role="status"></p>
+			</section>
 		</div>
-		<script src="popup.js"></script>
+		<script type="module" src="popup.js"></script>
 	</body>
 </html>
