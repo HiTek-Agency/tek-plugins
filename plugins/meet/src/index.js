@@ -67,6 +67,30 @@ const _connections = new Map();
 let _lastHandshakeAt = null;
 let _meetingId = null;
 let _mode = null; // "observer" | "participant" | null
+let _capture = { state: "idle" };
+let _captureRevision = 0;
+let _transcriptionError = null;
+const CAPTURE_USER_ACTION_CODE = "MEET_CAPTURE_USER_GESTURE_REQUIRED";
+const CAPTURE_GUIDANCE =
+	"Focus the Meet tab in the dedicated bot Chrome profile, open the Tek Meet extension, and click Start audio. Chrome requires the user to invoke the extension before capturing the tab.";
+
+function setCaptureState(state, details = {}) {
+	_capture = { state, ...details };
+	_captureRevision++;
+}
+
+function captureFailure(value) {
+	const code =
+		typeof value?.code === "string" ? value.code : "MEET_CAPTURE_FAILED";
+	const error =
+		typeof value?.error === "string"
+			? value.error
+			: "The extension did not confirm that audio capture started.";
+	setCaptureState(code === CAPTURE_USER_ACTION_CODE ? "needs-user" : "failed", {
+		code,
+		error,
+	});
+}
 const _pending = new Map();
 let _seq = 0;
 let _logger = console;
@@ -207,6 +231,8 @@ function shutdownTranscriber(transcriber) {
 }
 
 function clearMeetingState() {
+	setCaptureState("idle");
+	_transcriptionError = null;
 	_transcriber = null;
 	_archiveDir = null;
 	_startedAt = null;
@@ -237,7 +263,14 @@ function rejectSocketCalls(sock, error) {
 }
 
 function detachSocket(sock = _sock) {
-	if (_sock === sock) _sock = null;
+	if (_sock === sock) {
+		_sock = null;
+		if (_meetingId && _capture.state === "active")
+			setCaptureState("unknown", {
+				error:
+					"The control extension disconnected; current capture state is unknown.",
+			});
+	}
 	_connections.delete(sock);
 	rejectSocketCalls(sock, cancelledError());
 	try {
@@ -372,6 +405,8 @@ async function joinMeetOwned({ url, voiceProfileId }, mode, op) {
 	if (!meetingCode) return { ok: false, reason: "invalid-url" };
 	_meetingId = meetingCode;
 	_mode = mode;
+	setCaptureState("idle");
+	_transcriptionError = null;
 	_startedAt = new Date();
 	// Plan 104-05: keep the URL + title around so onMeetingEnd can stamp them
 	// into meta.json without re-deriving from cfg.
@@ -486,6 +521,7 @@ async function joinMeetOwned({ url, voiceProfileId }, mode, op) {
 		// Continue without transcriber — meeting still joins, audio frames
 		// will be silently dropped but Chrome + archive dir are still set up.
 		_transcriber = null;
+		_transcriptionError = `Local transcription is unavailable: ${e?.message || e}`;
 	}
 
 	// Spawn bot Chrome pointed at about:blank first so the main-world content
@@ -528,16 +564,27 @@ async function joinMeetOwned({ url, voiceProfileId }, mode, op) {
 		);
 	}
 
-	// Ask the extension to start tab-audio capture (plan 104-03 RPC).
+	// A Chrome window is not proof that capture has permission or started.
+	// Attempt once; a denied user-invocation grant requires an explicit click
+	// in the extension popup, whose owned state push updates readiness later.
+	setCaptureState("starting");
+	const captureRevision = _captureRevision;
 	try {
-		await _rpc(
+		const captureResult = await _rpc(
 			"meet.start-capture",
 			{ tabId: _meetTabId, meetingId: _meetingId },
 			60_000,
 		);
 		assertCurrent(op);
+		if (_captureRevision === captureRevision) {
+			if (captureResult?.ok === true && captureResult.meetingId === _meetingId)
+				setCaptureState("active");
+			else captureFailure(captureResult);
+		}
 	} catch (e) {
 		assertCurrent(op);
+		if (_captureRevision === captureRevision)
+			captureFailure({ code: e?.code, error: e?.message || String(e) });
 		_logger.warn?.(
 			`${LOG_PREFIX} meet.start-capture RPC failed: ${e?.message || e}`,
 		);
@@ -569,14 +616,35 @@ async function joinMeetOwned({ url, voiceProfileId }, mode, op) {
 		}
 	}
 
+	const ready = _capture.state === "active" && _transcriber !== null;
 	return {
-		ok: true,
+		ok: ready,
 		meetingId: _meetingId,
 		mode,
 		voiceProfileId: voiceProfileId ?? null,
 		archiveDir: _archiveDir,
 		tabId: _meetTabId,
-		note: "Chrome spawned + audio pipeline armed + transparency announce attempted.",
+		capture: { ..._capture },
+		transcriptionReady: _transcriber !== null,
+		...(!ready
+			? {
+					code:
+						_capture.state !== "active"
+							? (_capture.code ?? "MEET_CAPTURE_NOT_ACTIVE")
+							: "MEET_TRANSCRIBER_UNAVAILABLE",
+					error:
+						_capture.state !== "active"
+							? (_capture.error ?? "Audio capture is not active.")
+							: _transcriptionError,
+					guidance:
+						_capture.state === "needs-user"
+							? CAPTURE_GUIDANCE
+							: "The bot window may still be open. Check capture/transcription setup before continuing, or use Stop to close it. Do not repeat the join automatically.",
+				}
+			: {}),
+		note: ready
+			? "Audio capture and local transcription are ready; transparency announce was attempted. Meet admission is separate and may still require the host."
+			: "The bot window is open, but capture/transcription readiness is incomplete.",
 	};
 }
 
@@ -836,6 +904,31 @@ async function finishMeeting({ endedAt = new Date() } = {}, op) {
 			.filter(Boolean)
 			.filter((v, i, a) => a.indexOf(v) === i) || [];
 
+	if (_sock && _capture.state !== "idle" && _capture.state !== "stopped") {
+		try {
+			const stopped = await _rpc(
+				"meet.stop-capture",
+				{ expectedMeetingId: meetingId },
+				10_000,
+			);
+			assertCurrent(op);
+			if (stopped?.ok !== true)
+				throw new Error(
+					stopped?.error || "The extension did not confirm capture stopped.",
+				);
+			setCaptureState("stopped");
+		} catch (e) {
+			assertCurrent(op);
+			setCaptureState("unknown", {
+				code: "MEET_CAPTURE_STOP_UNCONFIRMED",
+				error: e?.message || String(e),
+			});
+			// Preserve the meeting for explicit emergency stop instead of
+			// allowing replacement capture over an unconfirmed old stream.
+			throw e;
+		}
+	}
+
 	// Include the final owned chunks in the archive before finalization.
 	await shutdownTranscriber(transcriber).catch(() => {});
 	assertCurrent(op);
@@ -1062,7 +1155,13 @@ export async function register(ctx) {
 				const p = _pending.get(msg.id);
 				if (!p || p.sock !== sock) return;
 				_pending.delete(msg.id);
-				if (msg.error) p.reject(new Error(msg.error));
+				if (msg.error)
+					p.reject(
+						Object.assign(
+							new Error(msg.error),
+							typeof msg.code === "string" ? { code: msg.code } : {},
+						),
+					);
 				else p.resolve(msg.value);
 				return;
 			}
@@ -1073,6 +1172,19 @@ export async function register(ctx) {
 				(msg.meetingId != null && msg.meetingId !== _meetingId)
 			)
 				return;
+			if (msg.kind === "meet.capture.state") {
+				if (
+					msg.meetingId !== _meetingId ||
+					!["active", "stopped", "needs-user", "failed"].includes(msg.state)
+				)
+					return;
+				setCaptureState(msg.state, {
+					...(typeof msg.error === "string" ? { error: msg.error } : {}),
+					...(typeof msg.code === "string" ? { code: msg.code } : {}),
+				});
+				return;
+			}
+
 			// Plan 104-04: DOM-scraped active-speaker update from
 			// content-isolated.js via the SW. Feeds the tracker; subsequent
 			// whisper flushes read tracker.getCurrent().name for speakerGuess.
@@ -1109,8 +1221,24 @@ export async function register(ctx) {
 		});
 
 		sock.on("close", () => {
+			const ownedAudio =
+				_connections.get(sock) === connection &&
+				connection.role === "audio" &&
+				connection.generation === _generation;
 			_connections.delete(sock);
-			if (_sock === sock) _sock = null;
+			if (ownedAudio && _meetingId && _capture.state === "active")
+				setCaptureState("unknown", {
+					error:
+						"The audio extension disconnected; current audio delivery is unknown.",
+				});
+			if (_sock === sock) {
+				_sock = null;
+				if (_meetingId && _capture.state === "active")
+					setCaptureState("unknown", {
+						error:
+							"The control extension disconnected; current capture state is unknown.",
+					});
+			}
 			rejectSocketCalls(sock, new Error("meet extension disconnected"));
 			_logger.info?.(`${LOG_PREFIX} extension disconnected`);
 		});
@@ -1179,6 +1307,13 @@ export async function register(ctx) {
 			connected: _sock !== null,
 			meetingId: _stopEvidence?.meetingId ?? _meetingId,
 			mode: _stopEvidence?.mode ?? _mode,
+			capture: _stopEvidence
+				? { state: "unknown", error: "Stop has not yet confirmed all cleanup." }
+				: { ..._capture },
+			transcriptionReady: _transcriber !== null,
+			...(_transcriptionError
+				? { transcriptionError: _transcriptionError }
+				: {}),
 			lastHandshakeAt: _lastHandshakeAt,
 			port,
 		};
