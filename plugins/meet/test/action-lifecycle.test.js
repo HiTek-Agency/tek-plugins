@@ -803,3 +803,26 @@ test("loss of the owned audio connection makes delivery unknown without replacin
 	assert.equal((await status()).connected, true);
 	assert.equal(plugin._getActiveSocket(), control);
 });
+
+test("owned capture recovery reports starting until a fresh active acknowledgement arrives", async () => {
+	const control = connect();
+	await join();
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "abc-defg-hij",
+		state: "starting",
+	});
+	assert.deepEqual((await status()).capture, { state: "starting" });
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "wrong-room",
+		state: "active",
+	});
+	assert.equal((await status()).capture.state, "starting");
+	control.message({
+		kind: "meet.capture.state",
+		meetingId: "abc-defg-hij",
+		state: "active",
+	});
+	assert.deepEqual((await status()).capture, { state: "active" });
+});
