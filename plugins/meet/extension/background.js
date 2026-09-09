@@ -15,6 +15,7 @@
  */
 
 import { dispatch } from "./dispatch.js";
+import { openBotSignin } from "./open-signin.js";
 import { runKeepaliveCycle, KEEPALIVE_INTERVAL_MS } from "./keepalive.js";
 import { buildChatPostCommands, buildTransparencyText } from "./chat-post.js";
 
@@ -106,6 +107,15 @@ function connect(meta) {
 					console.warn("[tek-meet] WS send failed", err);
 				}
 			};
+			if (msg.tool === "meet.open-signin") {
+				try {
+					const r = await openBotSignin(msg.args, chrome);
+					sendResult({ value: r });
+				} catch (e) {
+					sendResult({ error: String(e?.message || e) });
+				}
+				return;
+			}
 			if (msg.tool === "meet.navigate") {
 				try {
 					const r = await navigateBotTab(msg.args || {});
