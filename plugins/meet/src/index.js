@@ -1175,7 +1175,9 @@ export async function register(ctx) {
 			if (msg.kind === "meet.capture.state") {
 				if (
 					msg.meetingId !== _meetingId ||
-					!["active", "stopped", "needs-user", "failed"].includes(msg.state)
+					!["starting", "active", "stopped", "needs-user", "failed"].includes(
+						msg.state,
+					)
 				)
 					return;
 				setCaptureState(msg.state, {
