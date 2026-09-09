@@ -41,7 +41,7 @@
       "name": "Google Meet",
       "description": "Agent joins Google Meet as observer or wake-word participant — local whisper transcription, post-meeting Google Doc, desktop status chip",
       "author": "Tek",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "source": {
         "type": "git",
         "repo": "https://github.com/HiTek-Agency/tek-plugins",

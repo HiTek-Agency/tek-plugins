@@ -17,7 +17,10 @@ cd ../tek-plugins/plugins/meet
 npm test
 ```
 
-Expected: `139 pass, 0 fail`. Runs in ~170 ms. No gateway, no Chrome, no network.
+The suite includes real registration and handler lifecycle tests using Node module
+mocks, plus isolated transcriber/process-ownership regressions. No gateway, real
+Chrome, Google sign-in, or network is used. Node must support
+`--experimental-test-module-mocks` (the test script supplies the flag).
 
 ---
 

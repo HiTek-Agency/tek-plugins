@@ -62,7 +62,8 @@ function getOrCreateToken() {
 
 // Module-level state (same pattern as chrome plugin)
 let _wss = null;
-let _sock = null;
+let _sock = null; // control service-worker socket; audio uses its own connection
+const _connections = new Map();
 let _lastHandshakeAt = null;
 let _meetingId = null;
 let _mode = null; // "observer" | "participant" | null
@@ -86,6 +87,214 @@ let _meetingTitle = "";
 let _scanner = null;
 let _fsm = null;
 let _silenceTimer = null;
+// A stop invalidates every callback from the previous meeting. The operation
+// gate remains held until its in-flight setup/cleanup has actually settled.
+let _generation = 0;
+let _operation = null;
+let _unloading = false;
+let _registration = null;
+let _stopEvidence = null;
+const _shutdowns = new WeakMap();
+const _transcriberArchives = new WeakMap();
+
+function actionError(code, error) {
+	return { ok: false, code, error };
+}
+
+function cancelledError() {
+	return Object.assign(new Error("Meet operation was stopped."), {
+		code: "MEET_CANCELLED",
+	});
+}
+
+function assertCurrent(op) {
+	if (op.generation !== _generation || op.controller.signal.aborted)
+		throw cancelledError();
+}
+
+function runOperation(kind, run) {
+	const op = {
+		kind,
+		generation: _generation,
+		controller: new AbortController(),
+		spawning: false,
+	};
+	let settled;
+	op.done = new Promise((resolve) => {
+		settled = resolve;
+	});
+	_operation = op;
+	return (async () => {
+		try {
+			assertCurrent(op);
+			return await run(op);
+		} catch (e) {
+			return actionError(e?.code || "MEET_FAILED", e?.message || String(e));
+		} finally {
+			if (_operation === op) _operation = null;
+			settled();
+		}
+	})();
+}
+
+function busyError() {
+	return actionError(
+		"MEET_BUSY",
+		"Another Meet operation is still active or cleaning up. Stop it or wait for cleanup before trying again.",
+	);
+}
+
+function expectedMeetingError(msg) {
+	if (!Object.hasOwn(msg, "expectedMeetingId")) return null; // legacy emergency control
+	if (
+		msg.expectedMeetingId !== null &&
+		typeof msg.expectedMeetingId !== "string"
+	) {
+		return actionError(
+			"MEET_CONFLICT",
+			"expectedMeetingId must be a meeting ID or null. Refresh Meet status.",
+		);
+	}
+	if (msg.expectedMeetingId !== (_stopEvidence?.meetingId ?? _meetingId)) {
+		return actionError(
+			"MEET_CONFLICT",
+			"The active meeting changed. Refresh Meet status before trying again.",
+		);
+	}
+	return null;
+}
+
+function waitForOperation(op, ms) {
+	assertCurrent(op);
+	return new Promise((resolve, reject) => {
+		const signal = op.controller.signal;
+		const cancel = () => {
+			clearTimeout(timer);
+			reject(cancelledError());
+		};
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", cancel);
+			resolve();
+		}, ms);
+		signal.addEventListener("abort", cancel, { once: true });
+	});
+}
+
+async function spawnForOperation(op, options) {
+	assertCurrent(op);
+	op.spawning = true;
+	try {
+		await spawnBotChrome(options);
+	} finally {
+		op.spawning = false;
+	}
+	assertCurrent(op);
+}
+
+function shutdownTranscriber(transcriber) {
+	if (!transcriber) return Promise.resolve();
+	let shutdown = _shutdowns.get(transcriber);
+	if (!shutdown) {
+		shutdown = Promise.resolve()
+			.then(() => transcriber.shutdown?.())
+			.finally(() => {
+				const archive = _transcriberArchives.get(transcriber);
+				if (archive) archive.accepting = false;
+			});
+		_shutdowns.set(transcriber, shutdown);
+	}
+	return shutdown;
+}
+
+function clearMeetingState() {
+	_transcriber = null;
+	_archiveDir = null;
+	_startedAt = null;
+	_meetingId = null;
+	_mode = null;
+	_meetTabId = null;
+	_meetUrl = null;
+	_meetingTitle = "";
+	// The old transcriber may still read its captured tracker while flushing.
+	_tracker = null;
+	_scanner = null;
+	try {
+		_fsm?.reset();
+	} catch {
+		/* best-effort */
+	}
+	_fsm = null;
+	if (_silenceTimer) clearTimeout(_silenceTimer);
+	_silenceTimer = null;
+}
+
+function rejectSocketCalls(sock, error) {
+	for (const [id, pending] of _pending) {
+		if (pending.sock !== sock) continue;
+		_pending.delete(id);
+		pending.reject(error);
+	}
+}
+
+function detachSocket(sock = _sock) {
+	if (_sock === sock) _sock = null;
+	_connections.delete(sock);
+	rejectSocketCalls(sock, cancelledError());
+	try {
+		sock?.close();
+	} catch {
+		/* best-effort */
+	}
+}
+
+function detachAllSockets() {
+	for (const sock of _connections.keys()) detachSocket(sock);
+}
+
+function stopMeeting() {
+	if (_operation?.kind === "stop") return busyError();
+	const previous = _operation;
+	const spawning = previous?.spawning;
+	const transcriber = _transcriber;
+	_stopEvidence ??= { meetingId: _meetingId, mode: _mode };
+	_generation++;
+	previous?.controller.abort();
+	return runOperation("stop", async () => {
+		detachAllSockets();
+		clearMeetingState();
+		const errors = [];
+		const attempt = async (label, run) => {
+			try {
+				await run();
+			} catch (e) {
+				errors.push(`${label}: ${e?.message || e}`);
+			}
+		};
+		// Initiate browser termination immediately, before a whisper flush or a
+		// pending setup operation can delay the emergency stop.
+		const stopChrome = async () => {
+			const result = await stopBotChrome();
+			if (result?.stopped === false && result.reason !== "not-running") {
+				throw new Error(
+					"Chrome termination is unconfirmed. Retry stop before starting another Meet operation.",
+				);
+			}
+		};
+		const stop = attempt("stopBotChrome", stopChrome);
+		const shutdown = attempt("transcriber", () =>
+			shutdownTranscriber(transcriber),
+		);
+		await Promise.all([stop, shutdown, previous?.done]);
+		// A spawn already in progress when stop arrived can finish after the
+		// first stop. Keep the gate held and stop that late process as well.
+		if (spawning) await attempt("late Chrome cleanup", stopChrome);
+		if (errors.length === 0) _stopEvidence = null;
+		return {
+			ok: errors.length === 0,
+			error: errors.length ? errors.join("; ") : undefined,
+		};
+	});
+}
 
 /**
  * Default whisper model path — reuses voice-input-stt's model location so
@@ -110,15 +319,16 @@ export function _getActiveSocket() {
 }
 
 export function _rpc(tool, args, timeoutMs = 30_000) {
-	if (!_sock) return Promise.reject(new Error("meet extension not connected"));
+	const sock = _sock;
+	if (!sock) return Promise.reject(new Error("meet extension not connected"));
 	const id = ++_seq;
-	_sock.send(JSON.stringify({ id, kind: "call", tool, args }));
 	return new Promise((resolve, reject) => {
 		const t = setTimeout(() => {
 			_pending.delete(id);
 			reject(new Error(`${tool} timed out after ${timeoutMs}ms`));
 		}, timeoutMs);
-		_pending.set(id, {
+		const pending = {
+			sock,
 			resolve: (v) => {
 				clearTimeout(t);
 				resolve(v);
@@ -127,21 +337,40 @@ export function _rpc(tool, args, timeoutMs = 30_000) {
 				clearTimeout(t);
 				reject(e);
 			},
-			timer: t,
-		});
+		};
+		_pending.set(id, pending);
+		try {
+			sock.send(JSON.stringify({ id, kind: "call", tool, args }));
+		} catch (e) {
+			_pending.delete(id);
+			pending.reject(e);
+		}
 	});
 }
 
 function extractMeetCode(url) {
-	const m = url.match(/meet\.google\.com\/([a-z0-9-]+)/i);
-	return m ? m[1] : null;
+	try {
+		const parsed = new URL(url);
+		if (parsed.protocol !== "https:" || parsed.hostname !== "meet.google.com")
+			return null;
+		return (
+			parsed.pathname.match(/^\/([a-z0-9]+(?:-[a-z0-9]+)+)\/?$/i)?.[1] ?? null
+		);
+	} catch {
+		return null;
+	}
 }
 
-async function joinMeet({ url, voiceProfileId }, mode) {
-	if (typeof url !== "string" || !url.includes("meet.google.com/")) {
-		return { ok: false, reason: "invalid-url" };
-	}
-	_meetingId = extractMeetCode(url);
+async function joinMeet(args, mode) {
+	if (_unloading || _operation || _stopEvidence || _meetingId !== null)
+		return busyError();
+	return runOperation("join", (op) => joinMeetOwned(args, mode, op));
+}
+
+async function joinMeetOwned({ url, voiceProfileId }, mode, op) {
+	const meetingCode = typeof url === "string" ? extractMeetCode(url) : null;
+	if (!meetingCode) return { ok: false, reason: "invalid-url" };
+	_meetingId = meetingCode;
 	_mode = mode;
 	_startedAt = new Date();
 	// Plan 104-05: keep the URL + title around so onMeetingEnd can stamp them
@@ -172,7 +401,10 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 		const phrases = Array.isArray(rawPhrases)
 			? rawPhrases
 			: typeof rawPhrases === "string" && rawPhrases.length > 0
-				? rawPhrases.split(",").map((s) => s.trim()).filter(Boolean)
+				? rawPhrases
+						.split(",")
+						.map((s) => s.trim())
+						.filter(Boolean)
 				: ["hey tek", "tek join in"];
 		_scanner = createWakeWordScanner({ phrases });
 		_fsm = createMeetFsm();
@@ -183,16 +415,27 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	}
 
 	const modelPath = resolveWhisperModelPath(cfg.whisperModelPath);
+	// Final shutdown chunks still belong to this archive after stop invalidates
+	// the live meeting. They never enter a replacement archive or wake scanner.
+	const archive = {
+		accepting: true,
+		dir: _archiveDir,
+		meetingId: _meetingId,
+		tracker: _tracker,
+	};
 	try {
-		_transcriber = await createTranscriber({
+		const transcriber = await createTranscriber({
 			modelPath,
-			getSpeaker: () => _tracker?.getCurrent().name ?? null,
+			getSpeaker: () => archive.tracker?.getCurrent().name ?? null,
 			emitChunk: (chunk) => {
-				chunk.meetingId = _meetingId;
+				if (!archive.accepting) return;
+				chunk.meetingId = archive.meetingId;
 				try {
-					appendChunk(_archiveDir, chunk);
+					appendChunk(archive.dir, chunk);
 				} catch (e) {
-					_logger.warn?.(`${LOG_PREFIX} raw.jsonl append failed: ${e?.message || e}`);
+					_logger.warn?.(
+						`${LOG_PREFIX} raw.jsonl append failed: ${e?.message || e}`,
+					);
 				}
 				// Plan 104-05 reads raw.jsonl to build transcript.md.
 				// A future gateway push API (phase 108) will broadcast
@@ -205,6 +448,8 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 				// anyway, but gating here is cheaper). Skip self-echo chunks
 				// (plan 104-03 tags these during the bot's own TTS playback).
 				if (
+					op.generation === _generation &&
+					_operation?.kind !== "end" &&
 					_scanner &&
 					_fsm?.currentState() === STATES.OBSERVING &&
 					chunk.source !== "self-echo" &&
@@ -215,22 +460,26 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 						t_end_ms: chunk.t_end_ms,
 					});
 					if (r.matched) {
-						_logger.info?.(
-							`${LOG_PREFIX} wake-word '${r.phrase}' detected`,
-						);
+						_logger.info?.(`${LOG_PREFIX} wake-word '${r.phrase}' detected`);
 						handleWakeWord({
 							text: chunk.text,
 							matchedPhrase: r.phrase,
 						}).catch((e) =>
-							_logger.warn?.(
-								`${LOG_PREFIX} wake handler: ${e?.message || e}`,
-							),
+							_logger.warn?.(`${LOG_PREFIX} wake handler: ${e?.message || e}`),
 						);
 					}
 				}
 			},
 		});
+		_transcriberArchives.set(transcriber, archive);
+		if (op.generation !== _generation) {
+			await shutdownTranscriber(transcriber);
+			throw cancelledError();
+		}
+		_transcriber = transcriber;
 	} catch (e) {
+		archive.accepting = false;
+		assertCurrent(op);
 		_logger.warn?.(
 			`${LOG_PREFIX} transcriber init failed (whisper model missing?): ${e?.message || e}`,
 		);
@@ -243,7 +492,7 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	// script has a chance to run before Meet loads (RESEARCH Pitfall 1).
 	// Plan 104-04 now drives navigation + transparency announce after the
 	// WS handshake completes.
-	await spawnBotChrome({ meetUrl: url, logger: _logger });
+	await spawnForOperation(op, { meetUrl: url, logger: _logger });
 
 	// Plan 104-04: wait up to 30s for the extension SW WS handshake so we can
 	// drive it via _rpc. First-install users may take longer to load the
@@ -251,7 +500,7 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	// soft and let the user retry join.
 	const handshakeWaitStart = Date.now();
 	while (!_sock && Date.now() - handshakeWaitStart < 30_000) {
-		await new Promise((r) => setTimeout(r, 500));
+		await waitForOperation(op, 500);
 	}
 	if (!_sock) {
 		_logger.warn?.(
@@ -270,8 +519,10 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	// chrome.debugger to for the chat announce.
 	try {
 		const navR = await _rpc("meet.navigate", { url }, 15_000);
+		assertCurrent(op);
 		_meetTabId = navR?.tabId ?? null;
 	} catch (e) {
+		assertCurrent(op);
 		_logger.warn?.(
 			`${LOG_PREFIX} meet.navigate failed: ${e?.message || e} — continuing without chat announce`,
 		);
@@ -284,7 +535,9 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 			{ tabId: _meetTabId, meetingId: _meetingId },
 			60_000,
 		);
+		assertCurrent(op);
 	} catch (e) {
+		assertCurrent(op);
 		_logger.warn?.(
 			`${LOG_PREFIX} meet.start-capture RPC failed: ${e?.message || e}`,
 		);
@@ -298,7 +551,7 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 	// postTransparencyMessage returns {ok:false}. That's acceptable — the
 	// meeting is already joined, just without the announce.
 	if (_meetTabId != null) {
-		await new Promise((r) => setTimeout(r, 8000));
+		await waitForOperation(op, 8000);
 		const userName = resolveUserDisplayName(_currentCtx);
 		try {
 			const annR = await _rpc(
@@ -306,13 +559,13 @@ async function joinMeet({ url, voiceProfileId }, mode) {
 				{ tabId: _meetTabId, userName },
 				30_000,
 			);
+			assertCurrent(op);
 			_logger.info?.(
 				`${LOG_PREFIX} transparency announce ok=${annR?.ok} text=${JSON.stringify(annR?.text || "")}`,
 			);
 		} catch (e) {
-			_logger.warn?.(
-				`${LOG_PREFIX} meet.announce failed: ${e?.message || e}`,
-			);
+			assertCurrent(op);
+			_logger.warn?.(`${LOG_PREFIX} meet.announce failed: ${e?.message || e}`);
 		}
 	}
 
@@ -340,9 +593,16 @@ async function joinMeet({ url, voiceProfileId }, mode) {
  * and drops back to `observing` via llm-error. The FSM still flips visibly.
  */
 async function handleWakeWord({ text, matchedPhrase }) {
-	if (!_fsm) return;
+	const generation = _generation;
+	const fsm = _fsm;
+	const scanner = _scanner;
+	const ctx = _currentCtx;
+	const meetingId = _meetingId;
+	const current = () =>
+		generation === _generation && fsm === _fsm && _operation?.kind !== "end";
+	if (!fsm || !current()) return;
 	try {
-		_fsm.transition("wake");
+		fsm.transition("wake");
 		// MVP: the current chunk's text IS the utterance. Strip the wake phrase
 		// and use whatever remains (or a brief-answer prompt if nothing does).
 		const utterance =
@@ -350,19 +610,19 @@ async function handleWakeWord({ text, matchedPhrase }) {
 				.toLowerCase()
 				.replace(String(matchedPhrase || "").toLowerCase(), "")
 				.trim() || "Please answer briefly.";
-		_fsm.transition("utterance-end");
+		fsm.transition("utterance-end");
 
 		// Guard against an older gateway that predates plan 104-09 — the plugin
 		// can still load but the helper simply isn't on the context. The meet
 		// plugin requires "parent-agent" permission, which means the sandbox
 		// WILL expose generateReply/generateTts as long as the gateway is at
 		// 104-09 or later.
-		if (typeof _currentCtx?.generateReply !== "function") {
+		if (typeof ctx?.generateReply !== "function") {
 			_logger.error?.(
 				`${LOG_PREFIX} PluginContext.generateReply not available — gateway must be on phase 104-09 or later`,
 			);
 			try {
-				_fsm.transition("llm-error");
+				fsm.transition("llm-error");
 			} catch {
 				// ignore — FSM may have been reset mid-flight
 			}
@@ -371,15 +631,16 @@ async function handleWakeWord({ text, matchedPhrase }) {
 
 		let llmResponse = null;
 		try {
-			llmResponse = await _currentCtx.generateReply({
+			llmResponse = await ctx.generateReply({
 				prompt: utterance,
-				systemContext: `You are attending a Google Meet as a voice assistant. Meeting id: ${_meetingId}. Reply briefly and conversationally. Avoid reading long lists.`,
+				systemContext: `You are attending a Google Meet as a voice assistant. Meeting id: ${meetingId}. Reply briefly and conversationally. Avoid reading long lists.`,
 			});
 		} catch (e) {
 			_logger.warn?.(
 				`${LOG_PREFIX} ctx.generateReply threw: ${e?.message || e}`,
 			);
 		}
+		if (!current()) return;
 		if (!llmResponse?.text) {
 			_logger.warn?.(
 				`${LOG_PREFIX} participant response skipped — generateReply returned no text`,
@@ -387,19 +648,19 @@ async function handleWakeWord({ text, matchedPhrase }) {
 			// No LLM output — graceful-fail back to observing so the next
 			// wake-word is still detected.
 			try {
-				_fsm.transition("llm-error");
+				fsm.transition("llm-error");
 			} catch {
 				// ignore — FSM may have been reset mid-flight
 			}
 			return;
 		}
 
-		if (typeof _currentCtx?.generateTts !== "function") {
+		if (typeof ctx?.generateTts !== "function") {
 			_logger.error?.(
 				`${LOG_PREFIX} PluginContext.generateTts not available — gateway must be on phase 104-09 or later`,
 			);
 			try {
-				_fsm.transition("llm-error");
+				fsm.transition("llm-error");
 			} catch {
 				// ignore
 			}
@@ -408,28 +669,27 @@ async function handleWakeWord({ text, matchedPhrase }) {
 
 		let tts = null;
 		try {
-			tts = await _currentCtx.generateTts({
+			tts = await ctx.generateTts({
 				text: llmResponse.text,
 				sampleRate: 24000,
 			});
 		} catch (e) {
-			_logger.warn?.(
-				`${LOG_PREFIX} ctx.generateTts threw: ${e?.message || e}`,
-			);
+			_logger.warn?.(`${LOG_PREFIX} ctx.generateTts threw: ${e?.message || e}`);
 		}
+		if (!current()) return;
 		if (!tts?.pcmBase64) {
 			_logger.warn?.(
 				`${LOG_PREFIX} generateTts returned null — voice-output-tts not installed or failed; reverting to observing`,
 			);
 			try {
-				_fsm.transition("llm-error");
+				fsm.transition("llm-error");
 			} catch {
 				// ignore
 			}
 			return;
 		}
 
-		_fsm.transition("tts-ready");
+		fsm.transition("tts-ready");
 
 		// Suppress wake-word + whisper for the TTS duration + 500 ms safety so
 		// we don't self-trigger on echo of our own voice.
@@ -438,7 +698,7 @@ async function handleWakeWord({ text, matchedPhrase }) {
 		const approxBytes = Math.ceil(tts.pcmBase64.length * 0.75);
 		const approxSamples = Math.floor(approxBytes / 2);
 		const durMs = Math.round((approxSamples / 24000) * 1000) + 500;
-		_scanner?.setSuppressUntil(Date.now() + durMs);
+		scanner?.setSuppressUntil(Date.now() + durMs);
 
 		try {
 			await _rpc(
@@ -448,33 +708,38 @@ async function handleWakeWord({ text, matchedPhrase }) {
 			);
 		} catch (e) {
 			_logger.warn?.(`${LOG_PREFIX} meet.play-tts failed: ${e?.message || e}`);
+			if (!current()) return;
 			try {
-				_fsm.transition("tts-end");
+				fsm.transition("tts-end");
 			} catch {
 				// ignore
 			}
 			return;
 		}
 
+		if (!current()) return;
 		try {
-			_fsm.transition("tts-end");
+			fsm.transition("tts-end");
 		} catch {
 			// ignore — FSM may have been reset mid-flight
 		}
 
 		// Silence timer: N seconds after speech, log + stay in observing.
 		// CONTEXT D-09 default 15 s, overridable via config.
-		const silenceTimeoutMs = Number(_currentCtx?.getConfig?.()?.silenceTimeoutMs) || 15_000;
+		const silenceTimeoutMs =
+			Number(ctx?.getConfig?.()?.silenceTimeoutMs) || 15_000;
 		if (_silenceTimer) clearTimeout(_silenceTimer);
 		_silenceTimer = setTimeout(() => {
+			if (!current()) return;
 			_logger.info?.(
 				`${LOG_PREFIX} silence timeout; staying in observing for next wake-word`,
 			);
 		}, silenceTimeoutMs);
 	} catch (e) {
+		if (!current()) return;
 		_logger.warn?.(`${LOG_PREFIX} wake handler error: ${e?.message || e}`);
 		try {
-			_fsm?.transition("llm-error");
+			fsm?.transition("llm-error");
 		} catch {
 			// ignore
 		}
@@ -492,10 +757,14 @@ async function handleWakeWord({ text, matchedPhrase }) {
 function resolveUserDisplayName(ctx) {
 	try {
 		const cfg = ctx?.getConfig?.() ?? {};
-		if (typeof cfg.botDisplayName === "string" && cfg.botDisplayName.length > 0) {
+		if (
+			typeof cfg.botDisplayName === "string" &&
+			cfg.botDisplayName.length > 0
+		) {
 			return cfg.botDisplayName;
 		}
-		const fromCtx = typeof ctx?.getUserName === "function" ? ctx.getUserName() : null;
+		const fromCtx =
+			typeof ctx?.getUserName === "function" ? ctx.getUserName() : null;
 		if (typeof fromCtx === "string" && fromCtx.length > 0) return fromCtx;
 	} catch {
 		// ignore
@@ -529,12 +798,34 @@ function resolveUserDisplayName(ctx) {
  * After all of the above, clears meeting state so a stale onMeetingEnd
  * doesn't double-finalize.
  */
-async function onMeetingEnd({ endedAt = new Date() } = {}) {
+async function onMeetingEnd(options = {}) {
+	const generation = _generation;
+	if (_operation?.kind === "join") {
+		const joining = _operation;
+		joining.endRequested ??= joining.done.then(() => {
+			if (generation === _generation) return onMeetingEnd(options);
+		});
+		return joining.endRequested;
+	}
+	if (_operation || !_meetingId) return;
+	return runOperation("end", (op) => finishMeeting(options, op));
+}
+
+async function finishMeeting({ endedAt = new Date() } = {}, op) {
 	if (!_archiveDir || !_meetingId || !_startedAt) {
-		_logger.warn?.(`${LOG_PREFIX} onMeetingEnd called without active meeting state`);
+		_logger.warn?.(
+			`${LOG_PREFIX} onMeetingEnd called without active meeting state`,
+		);
 		return;
 	}
-	_logger.info?.(`${LOG_PREFIX} meeting ended; finalizing ${_archiveDir}`);
+	const archiveDir = _archiveDir;
+	const meetingId = _meetingId;
+	const startedAt = _startedAt;
+	const ctx = _currentCtx;
+	const tabId = _meetTabId;
+	const transcriber = _transcriber;
+
+	_logger.info?.(`${LOG_PREFIX} meeting ended; finalizing ${archiveDir}`);
 
 	const meetUrl = _meetUrl || "";
 	const title = _meetingTitle || "";
@@ -545,16 +836,20 @@ async function onMeetingEnd({ endedAt = new Date() } = {}) {
 			.filter(Boolean)
 			.filter((v, i, a) => a.indexOf(v) === i) || [];
 
+	// Include the final owned chunks in the archive before finalization.
+	await shutdownTranscriber(transcriber).catch(() => {});
+	assertCurrent(op);
+
 	// Step 1 — archive-writer.finalize
 	let archiveResult = null;
 	try {
 		archiveResult = await finalizeArchive({
-			archiveDir: _archiveDir,
+			archiveDir: archiveDir,
 			meta: {
 				meetUrl,
-				meetCode: _meetingId,
+				meetCode: meetingId,
 				title,
-				startedAt: _startedAt.getTime(),
+				startedAt: startedAt.getTime(),
 				endedAt: endedAt.getTime(),
 				participants,
 			},
@@ -563,11 +858,12 @@ async function onMeetingEnd({ endedAt = new Date() } = {}) {
 		_logger.warn?.(`${LOG_PREFIX} finalize failed: ${e?.message || e}`);
 	}
 
+	assertCurrent(op);
 	// Step 2 — summary placeholder
 	try {
-		writeSummaryMd(_archiveDir, {
+		writeSummaryMd(archiveDir, {
 			title,
-			startedAt: _startedAt.getTime(),
+			startedAt: startedAt.getTime(),
 			endedAt: endedAt.getTime(),
 			groups: archiveResult?.groups || [],
 			chunks: archiveResult?.chunks || [],
@@ -579,12 +875,16 @@ async function onMeetingEnd({ endedAt = new Date() } = {}) {
 	// Step 3 — Google Doc (best-effort). ctx.getGoogleAuth is scheduled for plan 104-09.
 	let docUrl = null;
 	try {
-		const auth = await _currentCtx?.getGoogleAuth?.();
+		const auth = await ctx?.getGoogleAuth?.();
+		assertCurrent(op);
 		if (auth) {
-			const summaryMd = readFileSync(join(_archiveDir, "summary.md"), "utf8");
-			const transcriptMd = readFileSync(join(_archiveDir, "transcript.md"), "utf8");
-			const dateSlice = _startedAt.toISOString().slice(0, 10);
-			const docTitle = `${title || _meetingId} — ${dateSlice}`;
+			const summaryMd = readFileSync(join(archiveDir, "summary.md"), "utf8");
+			const transcriptMd = readFileSync(
+				join(archiveDir, "transcript.md"),
+				"utf8",
+			);
+			const dateSlice = startedAt.toISOString().slice(0, 10);
+			const docTitle = `${title || meetingId} — ${dateSlice}`;
 			const { documentId, url } = await createMeetingDoc({
 				auth,
 				title: docTitle,
@@ -602,35 +902,37 @@ async function onMeetingEnd({ endedAt = new Date() } = {}) {
 		_logger.warn?.(`${LOG_PREFIX} Doc creation failed: ${e?.message || e}`);
 	}
 
+	assertCurrent(op);
 	// Step 4 — end-of-meeting chat post. meet.announce only knows how to post
 	// the D-18 transparency text today; re-posting it at meeting end leaves a
 	// visible marker in Meet chat that the bot wrote the archive. A future
 	// SW-side extension of the announce handler can accept an override text
 	// (archive + docUrl) — tracked for plan 104-09.
-	if (_meetTabId != null) {
+	if (tabId != null) {
 		try {
 			await _rpc(
 				"meet.announce",
-				{ tabId: _meetTabId, userName: "Tek" },
+				{ tabId: tabId, userName: "Tek" },
 				10_000,
 			).catch(() => {});
 		} catch {
 			// ignore — meet.announce is best-effort
 		}
 	}
+	assertCurrent(op);
 	_logger.info?.(
-		`${LOG_PREFIX} archive at ${_archiveDir}${docUrl ? ` · Doc: ${docUrl}` : ""}`,
+		`${LOG_PREFIX} archive at ${archiveDir}${docUrl ? ` · Doc: ${docUrl}` : ""}`,
 	);
 
 	// Step 5 — async reconciliation (fire-and-forget).
-	if (typeof _currentCtx?.getGoogleAuth === "function") {
-		const archiveDirSnapshot = _archiveDir;
-		const meetingCodeSnapshot = _meetingId;
-		const startedAtSnapshot = _startedAt;
-		_currentCtx
+	if (typeof ctx?.getGoogleAuth === "function") {
+		const archiveDirSnapshot = archiveDir;
+		const meetingCodeSnapshot = meetingId;
+		const startedAtSnapshot = startedAt;
+		ctx
 			.getGoogleAuth()
 			.then((auth) => {
-				if (!auth) return;
+				if (!auth || op.controller.signal.aborted) return;
 				return startReconciliation({
 					meetingCode: meetingCodeSnapshot,
 					startedAt: startedAtSnapshot,
@@ -651,36 +953,19 @@ async function onMeetingEnd({ endedAt = new Date() } = {}) {
 			.catch(() => {});
 	}
 
-	// Clear meeting state so future joins don't re-trigger on a stale state.
-	_meetingId = null;
-	_mode = null;
-	_archiveDir = null;
-	_startedAt = null;
-	_meetUrl = null;
-	_meetingTitle = "";
-	try {
-		await _transcriber?.shutdown?.();
-	} catch {
-		// ignore — best-effort
-	}
-	_transcriber = null;
-	_tracker?.reset();
-	// Plan 104-06: tear down participant-mode state as well so a future
-	// observer-mode join starts with no wake-word / FSM / timer residue.
-	_scanner = null;
-	try {
-		_fsm?.reset();
-	} catch {
-		// ignore
-	}
-	_fsm = null;
-	if (_silenceTimer) {
-		clearTimeout(_silenceTimer);
-		_silenceTimer = null;
-	}
+	assertCurrent(op);
+	// Invalidate late transcriber/wake-word callbacks after a normal end too.
+	_generation++;
+	detachAllSockets();
+	clearMeetingState();
 }
 
 export async function register(ctx) {
+	if (_registration)
+		throw new Error(
+			"Meet is already registered or still unloading. Wait for cleanup before reloading.",
+		);
+	_unloading = false;
 	_currentCtx = ctx;
 	_logger = ctx.logger ?? ctx.log ?? console;
 	const cfg = ctx.getConfig?.() ?? {};
@@ -689,7 +974,9 @@ export async function register(ctx) {
 
 	// Persist { port, token } for the extension popup + desktop UI to read.
 	mkdirSync(dirname(META_PATH), { recursive: true });
-	writeFileSync(META_PATH, JSON.stringify({ port, token }, null, 2), { mode: 0o600 });
+	writeFileSync(META_PATH, JSON.stringify({ port, token }, null, 2), {
+		mode: 0o600,
+	});
 	try {
 		chmodSync(META_PATH, 0o600);
 	} catch {
@@ -700,7 +987,11 @@ export async function register(ctx) {
 		host: "127.0.0.1",
 		port,
 		verifyClient: (info, cb) => {
-			const r = checkConnection(info.req.socket.remoteAddress, info.req.url, token);
+			const r = checkConnection(
+				info.req.socket.remoteAddress,
+				info.req.url,
+				token,
+			);
 			if (!r.ok) {
 				_logger.warn?.(`${LOG_PREFIX} rejected connection: ${r.reason}`);
 				return cb(false, r.code, r.reason);
@@ -709,13 +1000,27 @@ export async function register(ctx) {
 		},
 	});
 
+	const registration = { server: _wss, unload: null };
+	_registration = registration;
 	_wss.on("connection", (sock) => {
-		_sock = sock;
-		_lastHandshakeAt = Date.now();
-		_logger.info?.(`${LOG_PREFIX} extension connected`);
-		sock.send(JSON.stringify({ kind: "welcome", serverVersion: "0.1.0" }));
+		if (
+			_registration !== registration ||
+			_unloading ||
+			_operation?.kind === "stop"
+		) {
+			sock.close();
+			return;
+		}
+		const connection = { generation: _generation, role: null };
+		_connections.set(sock, connection);
+		sock.send(JSON.stringify({ kind: "welcome", serverVersion: "0.1.1" }));
 
 		sock.on("message", (raw) => {
+			if (
+				_connections.get(sock) !== connection ||
+				connection.generation !== _generation
+			)
+				return;
 			_lastHandshakeAt = Date.now();
 			let msg;
 			try {
@@ -723,43 +1028,51 @@ export async function register(ctx) {
 			} catch {
 				return;
 			}
+			if (!msg || typeof msg !== "object") return;
 			if (msg.kind === "hello") {
-				_logger.info?.(
-					`${LOG_PREFIX} hello from ext v${msg.extVersion} chrome ${msg.chromeVersion}`,
-				);
+				if (connection.role && connection.role !== "control") return;
+				connection.role = "control";
+				if (_sock && _sock !== sock) detachSocket(_sock);
+				_sock = sock;
+				_logger.info?.(`${LOG_PREFIX} control extension connected`);
 				return;
 			}
+			if (msg.kind === "hello-offscreen") {
+				if (connection.role || msg.role !== "audio-source") return;
+				connection.role = "audio";
+				return;
+			}
+			if (connection.role === "audio") {
+				if (
+					msg.kind === "meet.audio.frame" &&
+					_meetingId &&
+					msg.meetingId === _meetingId &&
+					_transcriber
+				) {
+					_transcriber
+						.ingestFrame(msg.frame, msg.t, msg.suppressed === true)
+						.catch((e) =>
+							_logger.warn?.(`${LOG_PREFIX} ingestFrame: ${e?.message || e}`),
+						);
+				}
+				return;
+			}
+			if (connection.role !== "control" || _sock !== sock) return;
 			if (msg.kind === "result" && typeof msg.id === "number") {
 				const p = _pending.get(msg.id);
-				if (!p) return;
+				if (!p || p.sock !== sock) return;
 				_pending.delete(msg.id);
 				if (msg.error) p.reject(new Error(msg.error));
 				else p.resolve(msg.value);
 				return;
 			}
-			// Plan 104-03: inbound audio frames from the extension's offscreen
-			// doc. Fire-and-forget — ingestFrame buffers internally.
-			if (msg.kind === "meet.audio.frame") {
-				if (_transcriber) {
-					_transcriber
-						.ingestFrame(msg.frame, msg.t, msg.suppressed === true)
-						.catch((e) =>
-							_logger.warn?.(
-								`${LOG_PREFIX} ingestFrame: ${e?.message || e}`,
-							),
-						);
-				}
+			// Extension events that identify a meeting must match it. Legacy
+			// events without an ID still require an active, owned connection.
+			if (
+				!_meetingId ||
+				(msg.meetingId != null && msg.meetingId !== _meetingId)
+			)
 				return;
-			}
-			// Plan 104-03: offscreen doc hello (role-advertising). Logged but
-			// non-blocking — the main SW socket's hello remains the source of
-			// truth for handshake state.
-			if (msg.kind === "hello-offscreen") {
-				_logger.info?.(
-					`${LOG_PREFIX} offscreen connected (role=${msg.role || "unknown"})`,
-				);
-				return;
-			}
 			// Plan 104-04: DOM-scraped active-speaker update from
 			// content-isolated.js via the SW. Feeds the tracker; subsequent
 			// whisper flushes read tracker.getCurrent().name for speakerGuess.
@@ -786,9 +1099,7 @@ export async function register(ctx) {
 			// summary + Doc + reconciler). Fire-and-forget so the socket stays
 			// responsive to in-flight responses.
 			if (msg.kind === "meet.in-call-ended") {
-				const endedAt = msg.at
-					? new Date(msg.at)
-					: new Date();
+				const endedAt = msg.at ? new Date(msg.at) : new Date();
 				onMeetingEnd({ endedAt }).catch((e) =>
 					_logger.warn?.(`${LOG_PREFIX} onMeetingEnd: ${e?.message || e}`),
 				);
@@ -798,7 +1109,9 @@ export async function register(ctx) {
 		});
 
 		sock.on("close", () => {
+			_connections.delete(sock);
 			if (_sock === sock) _sock = null;
+			rejectSocketCalls(sock, new Error("meet extension disconnected"));
 			_logger.info?.(`${LOG_PREFIX} extension disconnected`);
 		});
 	});
@@ -821,7 +1134,10 @@ export async function register(ctx) {
 				},
 				required: ["url"],
 			},
-			execute: async (args) => joinMeet(args, "observer"),
+			execute: async (args) =>
+				_registration === registration
+					? joinMeet(args, "observer")
+					: busyError(),
 		},
 		{ approvalTier: "session" },
 	);
@@ -837,12 +1153,16 @@ export async function register(ctx) {
 					url: { type: "string" },
 					voiceProfileId: {
 						type: "string",
-						description: "Optional voice profile id from config.voiceProfiles[]",
+						description:
+							"Optional voice profile id from config.voiceProfiles[]",
 					},
 				},
 				required: ["url"],
 			},
-			execute: async (args) => joinMeet(args, "participant"),
+			execute: async (args) =>
+				_registration === registration
+					? joinMeet(args, "participant")
+					: busyError(),
 		},
 		{ approvalTier: "always" },
 	);
@@ -854,9 +1174,11 @@ export async function register(ctx) {
 			type: "plugin.meet.status.result",
 			id: m.id,
 			requestId: m.id,
+			conditionalControlsVersion: 1,
+			operation: _operation?.kind ?? (_stopEvidence ? "stop-failed" : null),
 			connected: _sock !== null,
-			meetingId: _meetingId,
-			mode: _mode,
+			meetingId: _stopEvidence?.meetingId ?? _meetingId,
+			mode: _stopEvidence?.mode ?? _mode,
 			lastHandshakeAt: _lastHandshakeAt,
 			port,
 		};
@@ -873,60 +1195,15 @@ export async function register(ctx) {
 		// NOT route through the agent-tool approvalTier ladder.
 		ctx.addWsHandler("kick", async (msg) => {
 			const m = msg && typeof msg === "object" ? msg : {};
-			_logger.info?.(`${LOG_PREFIX} kick requested by desktop`);
-			let ok = true;
-			let errs = [];
-			// Best-effort: flush + release whisper transcriber.
-			try {
-				await _transcriber?.shutdown();
-			} catch (e) {
-				ok = false;
-				errs.push(`transcriber: ${e?.message || e}`);
-			}
-			_transcriber = null;
-			// Drop tracker state so the next join starts fresh.
-			try {
-				_tracker?.reset();
-			} catch {
-				// ignore
-			}
-			_tracker = null;
-			// Plan 104-06: drop participant-mode state as well (kick may fire
-			// mid-awake; scanner/FSM/timer must go).
-			_scanner = null;
-			try {
-				_fsm?.reset();
-			} catch {
-				// ignore
-			}
-			_fsm = null;
-			if (_silenceTimer) {
-				clearTimeout(_silenceTimer);
-				_silenceTimer = null;
-			}
-			_meetingId = null;
-			_mode = null;
-			_meetTabId = null;
-			// Close the extension socket (if any) — triggers the content
-			// side's onclose + reconnect, but Chrome is about to die anyway.
-			try {
-				_sock?.close();
-			} catch {
-				// ignore
-			}
-			_sock = null;
-			try {
-				await stopBotChrome();
-			} catch (e) {
-				ok = false;
-				errs.push(`stopBotChrome: ${e?.message || e}`);
-			}
+			const result =
+				(_registration !== registration ? busyError() : null) ||
+				expectedMeetingError(m) ||
+				(await stopMeeting());
 			return {
 				type: "plugin.meet.kick.result",
 				id: m.id,
 				requestId: m.id,
-				ok,
-				error: errs.length ? errs.join("; ") : undefined,
+				...result,
 			};
 		});
 
@@ -939,44 +1216,32 @@ export async function register(ctx) {
 		// accounts page immediately after spawn.
 		ctx.addWsHandler("open-signin", async (msg) => {
 			const m = msg && typeof msg === "object" ? msg : {};
-			_logger.info?.(`${LOG_PREFIX} open-signin requested by desktop`);
-			try {
-				await spawnBotChrome({
-					meetUrl: "https://accounts.google.com/signin",
-					logger: _logger,
-					startUrl: "https://accounts.google.com/signin",
-				});
-				// If the extension is already handshaken (rare for a fresh
-				// profile but possible on re-sign-in), navigate the about:blank
-				// tab explicitly so the user lands on the sign-in page.
-				if (_sock) {
-					try {
-						await _rpc(
-							"meet.navigate",
-							{ url: "https://accounts.google.com/signin" },
-							10_000,
-						);
-					} catch (e) {
-						_logger.warn?.(
-							`${LOG_PREFIX} open-signin navigate skipped: ${e?.message || e}`,
-						);
+			const refusal =
+				(_registration !== registration ? busyError() : null) ||
+				expectedMeetingError(m) ||
+				(_unloading || _operation || _stopEvidence || _meetingId !== null
+					? busyError()
+					: null);
+			const result =
+				refusal ||
+				(await runOperation("signin", async (op) => {
+					await spawnForOperation(op, {
+						meetUrl: "https://accounts.google.com/signin",
+						logger: _logger,
+						startUrl: "https://accounts.google.com/signin",
+					});
+					if (_sock) {
+						await _rpc("meet.open-signin", {}, 10_000);
+						assertCurrent(op);
 					}
-				}
-				return {
-					type: "plugin.meet.open-signin.result",
-					id: m.id,
-					requestId: m.id,
-					ok: true,
-				};
-			} catch (e) {
-				return {
-					type: "plugin.meet.open-signin.result",
-					id: m.id,
-					requestId: m.id,
-					ok: false,
-					error: e?.message || String(e),
-				};
-			}
+					return { ok: true };
+				}));
+			return {
+				type: "plugin.meet.open-signin.result",
+				id: m.id,
+				requestId: m.id,
+				...result,
+			};
 		});
 	} else {
 		_logger.warn?.(
@@ -984,88 +1249,34 @@ export async function register(ctx) {
 		);
 	}
 
-	return {
-		cleanup: async () => {
-			// Plan 104-03: flush + release whisper BEFORE tearing down Chrome
-			// so any tail audio in the buffer still lands in raw.jsonl.
-			try {
-				await _transcriber?.shutdown();
-			} catch (e) {
-				_logger.warn?.(`${LOG_PREFIX} transcriber shutdown: ${e?.message || e}`);
-			}
-			_transcriber = null;
-			_archiveDir = null;
-			_startedAt = null;
-			// Plan 104-04: drop tracker state so the next join starts fresh.
-			_tracker?.reset();
-			_tracker = null;
-			// Plan 104-06: drop participant-mode state.
-			_scanner = null;
-			try {
-				_fsm?.reset();
-			} catch {
-				// ignore
-			}
-			_fsm = null;
-			if (_silenceTimer) {
-				clearTimeout(_silenceTimer);
-				_silenceTimer = null;
-			}
-			_meetTabId = null;
-			try {
-				_wss?.close();
-			} catch {
-				// ignore
-			}
+	return { cleanup: () => unload(registration, false) };
+}
+
+function unload(registration, finalize) {
+	if (!registration || _registration !== registration) return Promise.resolve();
+	if (registration.unload) return registration.unload;
+	_unloading = true;
+	registration.unload = (async () => {
+		// Exported unload finalizes; registered cleanup remains stop-only.
+		if (finalize) await onMeetingEnd().catch(() => {});
+		if (_operation?.kind === "stop") await _operation.done;
+		else await stopMeeting();
+		try {
+			registration.server.close();
+		} catch {
+			/* best-effort */
+		}
+		if (_registration === registration) {
 			_wss = null;
-			_sock = null;
+			_registration = null;
 			_lastHandshakeAt = null;
-			_pending.clear();
-			await stopBotChrome().catch(() => {});
-		},
-	};
+		}
+	})();
+	return registration.unload;
 }
 
 export async function cleanup() {
-	// Plan 104-05: if a meeting is still active on unload, finalize first so
-	// the archive + summary land before we tear down whisper + Chrome.
-	if (_archiveDir && _meetingId && _startedAt) {
-		await onMeetingEnd().catch(() => {});
-	}
-	try {
-		await _transcriber?.shutdown();
-	} catch {
-		// ignore — cleanup path is best-effort
-	}
-	_transcriber = null;
-	_archiveDir = null;
-	_startedAt = null;
-	// Plan 104-04: drop tracker state.
-	_tracker?.reset();
-	_tracker = null;
-	// Plan 104-06: drop participant-mode state.
-	_scanner = null;
-	try {
-		_fsm?.reset();
-	} catch {
-		// ignore
-	}
-	_fsm = null;
-	if (_silenceTimer) {
-		clearTimeout(_silenceTimer);
-		_silenceTimer = null;
-	}
-	_meetTabId = null;
-	try {
-		_wss?.close();
-	} catch {
-		// ignore
-	}
-	_wss = null;
-	_sock = null;
-	_lastHandshakeAt = null;
-	_pending.clear();
-	await stopBotChrome().catch(() => {});
+	await unload(_registration, true);
 }
 
 // Plan 104-09: test-only entry point. Lets wake-word-scanner.test.js exercise
