@@ -5,7 +5,7 @@ import * as fs from "node:fs";
 
 test("replaced sockets cannot change the new handshake or resolve its calls", async () => {
   let server;
-  class Server extends EventEmitter { constructor() { super(); server = this; } close() {} }
+  class Server extends EventEmitter { constructor(options) { super(); this.options = options; server = this; } close() {} }
   class Socket extends EventEmitter {
     readyState = 1;
     sent = [];
@@ -22,6 +22,7 @@ test("replaced sockets cannot change the new handshake or resolve its calls", as
   const tools = {};
   const events = [];
   await plugin.register({ addTool(name, tool) { tools[name] = tool; }, send(event) { events.push(event); }, addWsHandler(_name, handler) { status = handler; } });
+  assert.equal(server.options.maxPayload, 16 * 1024 * 1024);
   try {
     const old = new Socket();
     server.emit("connection", old);

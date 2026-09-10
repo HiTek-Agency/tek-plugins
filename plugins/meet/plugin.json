@@ -1,10 +1,16 @@
 {
 	"id": "meet",
 	"name": "Google Meet",
-	"version": "0.1.1",
-	"description": "Agent joins Google Meet as observer or wake-word participant. Local whisper transcription, DOM speaker attribution, post-meeting Google Doc + summary.",
+	"version": "0.1.2",
+	"description": "Agent joins Google Meet as observer or wake-word participant. Local whisper transcription, DOM speaker attribution, and a post-meeting transcript archive; Google Docs and generated summaries depend on host integrations.",
 	"entryPoint": "src/index.js",
-	"permissions": ["tools", "config", "context", "ws-handlers", "parent-agent"],
+	"permissions": [
+		"tools",
+		"config",
+		"context",
+		"ws-handlers",
+		"parent-agent"
+	],
 	"configSchema": [
 		{
 			"key": "wsPort",
@@ -42,7 +48,10 @@
 			"description": "Override path to the whisper GGML model. Empty = reuse voice-input-stt's model."
 		}
 	],
-	"providesTools": ["meet__join_observer", "meet__join_participant"],
+	"providesTools": [
+		"meet__join_observer",
+		"meet__join_participant"
+	],
 	"source": {
 		"type": "git",
 		"repo": "https://github.com/HiTek-Agency/tek-plugins"

@@ -51,6 +51,17 @@ test("extension/manifest.json declares tabCapture + offscreen + scripting", () =
 	);
 });
 
+test("extension handshake version matches the extension manifest", () => {
+	const manifest = JSON.parse(
+		readFileSync(join(PLUGIN_DIR, "extension/manifest.json"), "utf8"),
+	);
+	const background = readFileSync(
+		join(PLUGIN_DIR, "extension/background.js"),
+		"utf8",
+	);
+	assert.match(background, new RegExp(`const EXT_VERSION = ["']${manifest.version}["']`));
+});
+
 test("src/index.js exists and exports register", async () => {
 	const mod = await import(join(PLUGIN_DIR, "src/index.js"));
 	assert.equal(typeof mod.register, "function");

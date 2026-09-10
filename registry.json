@@ -1,11 +1,11 @@
 {
   "version": 1,
-  "updatedAt": "2026-04-20T00:00:00Z",
+  "updatedAt": "2026-09-09T00:00:00Z",
   "plugins": [
     {
       "id": "url-summarize",
       "name": "URL Summarizer",
-      "description": "Summarize web pages, articles, YouTube videos, and other URLs using AI — powered by the summarize CLI",
+      "description": "Summarize web pages, articles, YouTube videos, and other URLs using AI \u2014 powered by the summarize CLI",
       "author": "Tek",
       "version": "0.1.0",
       "source": {
@@ -13,61 +13,87 @@
         "repo": "https://github.com/HiTek-Agency/tek-plugins",
         "path": "plugins/url-summarize"
       },
-      "permissions": ["tools", "config", "vault-read", "context"],
+      "permissions": [
+        "tools",
+        "config",
+        "vault-read",
+        "context"
+      ],
       "category": "productivity",
-      "icon": "🔗",
+      "icon": "\ud83d\udd17",
       "featured": true,
       "homepage": "https://github.com/steipete/summarize"
     },
     {
       "id": "chrome",
       "name": "Chrome Control",
-      "description": "Drive your real Chrome browser with AI — screenshots, navigation, clicks, typing, JS eval",
+      "description": "Drive your real Chrome browser with AI \u2014 screenshots, navigation, clicks, typing, JS eval",
       "author": "Tek",
-      "version": "0.1.0",
+      "version": "0.4.5",
       "source": {
         "type": "git",
         "repo": "https://github.com/HiTek-Agency/tek-plugins",
         "path": "plugins/chrome"
       },
-      "permissions": ["tools", "config", "context", "ws-handlers"],
-      "platforms": ["darwin", "win32", "linux"],
+      "permissions": [
+        "tools",
+        "config",
+        "context",
+        "ws-handlers"
+      ],
+      "platforms": [
+        "darwin",
+        "win32",
+        "linux"
+      ],
       "category": "automation",
-      "icon": "🌐",
+      "icon": "\ud83c\udf10",
       "featured": false
     },
     {
       "id": "meet",
       "name": "Google Meet",
-      "description": "Agent joins Google Meet as observer or wake-word participant — local whisper transcription, post-meeting Google Doc, desktop status chip",
+      "description": "Agent joins Google Meet as observer or wake-word participant \u2014 local transcription and meeting assistance with host integrations",
       "author": "Tek",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "source": {
         "type": "git",
         "repo": "https://github.com/HiTek-Agency/tek-plugins",
         "path": "plugins/meet"
       },
-      "permissions": ["tools", "config", "context", "ws-handlers"],
-      "platforms": ["darwin"],
+      "permissions": [
+        "tools",
+        "config",
+        "context",
+        "ws-handlers",
+        "parent-agent"
+      ],
+      "platforms": [
+        "darwin"
+      ],
       "category": "productivity",
-      "icon": "🎙️",
+      "icon": "\ud83c\udf99\ufe0f",
       "featured": true
     },
     {
       "id": "mac-control",
       "name": "Mac Control",
-      "description": "Control your Mac with AI — screenshots, UI element interaction, typing, window management via Peekaboo",
+      "description": "Control the Gateway host through a user-granted system lease. Bundled with Tek Gateway.",
       "author": "Tek",
-      "version": "0.1.0",
+      "version": "0.2.2",
       "source": {
-        "type": "git",
-        "repo": "https://github.com/HiTek-Agency/tek-plugins",
-        "path": "plugins/mac-control"
+        "type": "builtin"
       },
-      "permissions": ["tools", "config", "context"],
-      "platforms": ["darwin"],
+      "permissions": [
+        "tools",
+        "config",
+        "context"
+      ],
+      "platforms": [
+        "darwin"
+      ],
       "category": "automation",
-      "icon": "🖥️",
+      "icon": "\ud83d\udda5\ufe0f",
       "featured": true,
       "homepage": "https://github.com/steipete/peekaboo"
     },
@@ -80,9 +106,14 @@
       "source": {
         "type": "builtin"
       },
-      "permissions": ["ws-handlers", "config", "context", "network"],
+      "permissions": [
+        "ws-handlers",
+        "config",
+        "context",
+        "network"
+      ],
       "category": "voice",
-      "icon": "🎙️",
+      "icon": "\ud83c\udf99\ufe0f",
       "builtin": true
     },
     {
@@ -94,9 +125,15 @@
       "source": {
         "type": "builtin"
       },
-      "permissions": ["ws-handlers", "config", "context", "network", "audio-output"],
+      "permissions": [
+        "ws-handlers",
+        "config",
+        "context",
+        "network",
+        "audio-output"
+      ],
       "category": "voice",
-      "icon": "🔊",
+      "icon": "\ud83d\udd0a",
       "builtin": true
     },
     {
@@ -108,9 +145,14 @@
       "source": {
         "type": "builtin"
       },
-      "permissions": ["ws-handlers", "config", "context", "network"],
+      "permissions": [
+        "ws-handlers",
+        "config",
+        "context",
+        "network"
+      ],
       "category": "voice",
-      "icon": "🗣️",
+      "icon": "\ud83d\udde3\ufe0f",
       "builtin": true
     }
   ]

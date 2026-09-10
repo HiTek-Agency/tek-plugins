@@ -6,11 +6,19 @@ Official plugin registry for [Tek](https://github.com/HiTek-Agency/Tek-Agent-Hub
 
 Open the Tek desktop app → **Plugins** → **Browse** tab to discover and install plugins.
 
+The registry and every source plugin manifest can be checked locally with:
+
+```bash
+node scripts/verify-registry.mjs
+```
+
 ## Available Plugins
 
 | Plugin | Category | Description |
 |--------|----------|-------------|
 | 🔗 URL Summarizer | Productivity | Summarize web pages, articles, YouTube videos using AI |
+| 🌐 Chrome Control | Automation | Drive Chrome — screenshots, navigation, clicks, typing, and JavaScript |
+| 🎙️ Google Meet | Productivity | Join Meet for local transcription and meeting assistance |
 | 🖥️ Mac Control | Automation | Control your Mac — screenshots, clicks, typing, window management |
 | 🎙️ Voice Input (STT) | Voice | Speech-to-text with local Whisper and cloud providers |
 | 🔊 Voice Output (TTS) | Voice | Text-to-speech with macOS, OpenAI, ElevenLabs |
@@ -155,3 +163,22 @@ context.logger.error("message")
 4. We'll review and merge
 
 Plugins are installed disabled by default — users must explicitly enable them.
+
+## Canonical implementations and release protocol
+
+Chrome, Meet and URL Summarizer are source plugins in this repository. Mac Control
+and the voice plugins are built into Tek Gateway; their canonical source is in
+`tek/packages/gateway/src/plugins`. The former Mac Control copy was behind the
+bundled version and has been removed to prevent installing a downgrade. Its
+history remains in Git. Update built-ins through the Gateway release procedure.
+
+For source plugins, bump package, plugin and extension versions together, update
+`registry.json`, run `node scripts/verify-registry.mjs` and each affected plugin's
+`npm test`, and verify the exact packaged entry point and extension files. The
+registry now exposes the manifest's actual requested permissions. Commit and
+push reviewed source before using the Gateway plugin-update UI. Reload an
+unpacked Chrome extension explicitly to activate its new service worker.
+
+Use `../tek/docs/engineering/WORKFLOW.md` for shared ownership and review rules.
+Do not overwrite installed plugin configuration or user artifacts while updating
+code, and do not treat a passing unit test as live meeting/browser acceptance.

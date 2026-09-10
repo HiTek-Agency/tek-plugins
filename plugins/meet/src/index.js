@@ -1106,7 +1106,7 @@ export async function register(ctx) {
 		}
 		const connection = { generation: _generation, role: null };
 		_connections.set(sock, connection);
-		sock.send(JSON.stringify({ kind: "welcome", serverVersion: "0.1.1" }));
+		sock.send(JSON.stringify({ kind: "welcome", serverVersion: "0.1.2" }));
 
 		sock.on("message", (raw) => {
 			if (

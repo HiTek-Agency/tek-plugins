@@ -1,8 +1,0 @@
-{
-	"name": "@tek/plugin-mac-control",
-	"version": "0.2.0",
-	"private": true,
-	"type": "module",
-	"main": "dist/index.js",
-	"types": "dist/index.d.ts"
-}

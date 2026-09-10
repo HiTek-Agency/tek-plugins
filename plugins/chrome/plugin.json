@@ -1,7 +1,7 @@
 {
 	"id": "chrome",
 	"name": "Chrome Control",
-	"version": "0.4.4",
+	"version": "0.4.5",
 	"description": "Drive user-granted Chrome tabs through a model-agnostic local bridge with bounded page-state modes, paged full inspection, explicit pause, takeover, navigation, clicks, forms, screenshots, waits, and JavaScript",
 	"entryPoint": "dist/index.js",
 	"permissions": [

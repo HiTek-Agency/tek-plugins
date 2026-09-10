@@ -32,6 +32,9 @@ const SCREENSHOT_DIR = join(
 	"data",
 	"screenshots",
 );
+// Keep enough room for a compressed viewport screenshot plus RPC metadata while
+// preventing an authenticated local peer from reserving an unbounded frame.
+const MAX_WS_PAYLOAD_BYTES = 16 * 1024 * 1024;
 mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 function getOrCreateToken() {
@@ -165,6 +168,7 @@ export async function register(ctx) {
 	_wss = new WebSocketServer({
 		host: "127.0.0.1",
 		port,
+		maxPayload: MAX_WS_PAYLOAD_BYTES,
 		verifyClient: (info, cb) => {
 			const result = checkConnection(
 				info.req.socket.remoteAddress,

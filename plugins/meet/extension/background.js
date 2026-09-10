@@ -20,8 +20,9 @@ import { observeCaptureTarget } from "./capture-guards.js";
 import { createCaptureController } from "./capture-controller.js";
 import { runKeepaliveCycle, KEEPALIVE_INTERVAL_MS } from "./keepalive.js";
 import { buildChatPostCommands, buildTransparencyText } from "./chat-post.js";
+import { isMeetUrl } from "./meet-url.js";
 
-const EXT_VERSION = "0.1.0";
+const EXT_VERSION = "0.1.2";
 const STORAGE_KEY = "tek_meet_connection";
 const OFFSCREEN_URL = "offscreen.html";
 const KEEPALIVE_ALARM = "tek-meet-keepalive";
@@ -387,7 +388,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
  * step.
  */
 async function navigateBotTab({ url }) {
-	if (typeof url !== "string" || !url.includes("meet.google.com/")) {
+	if (!isMeetUrl(url)) {
 		throw new Error("meet.navigate: invalid url");
 	}
 	const tabs = await chrome.tabs.query({ url: "about:blank" });

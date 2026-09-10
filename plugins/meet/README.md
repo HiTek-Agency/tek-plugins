@@ -2,6 +2,8 @@
 
 Join Google Meet as an observer (silent transcription + notes) or a wake-word participant (listens passively, speaks only when a wake-word fires). Local whisper transcription, DOM-based speaker attribution, post-meeting Google Doc + chat summary + on-disk archive.
 
+> **0.1.2:** Exact HTTPS Meet room validation and extension/plugin version checks added.
+
 > **0.1.1:** Desktop control and cleanup race coverage is available. Live Google sign-in, admission, audio, and post-meeting delivery still require separate acceptance; unit tests do not establish that those external flows work.
 
 The gateway-side plugin runs a local WebSocket server on `127.0.0.1:52881`. A companion MV3 Chrome extension (shipped in `extension/`) connects to that server from a dedicated Chrome profile and captures Meet tab audio via `chrome.tabCapture` + an offscreen document. Audio is streamed to the gateway as PCM16 frames and transcribed locally with `@fugood/whisper.node` (reused from the voice-input-stt plugin).
@@ -116,9 +118,9 @@ permission; live acceptance remains separate.
 
 ### Updating an existing bot extension
 
-After updating the plugin to **0.1.1**, open `chrome://extensions` in the dedicated
+After updating the plugin to **0.1.2**, open `chrome://extensions` in the dedicated
 bot profile and **Reload** the unpacked Tek Meet extension. It must also show
-version **0.1.1** to support the fixed sign-in route. An older running extension
+version **0.1.2** to support the fixed sign-in route. An older running extension
 rejects that route and the Desktop reports the failure; update/reload it rather
 than treating the failed action as success. The bot profile/account is preserved.
 
