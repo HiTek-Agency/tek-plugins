@@ -154,7 +154,7 @@ export async function register(ctx) {
 	const port = Number(cfg.wsPort) || 52871;
 	const token = getOrCreateToken();
 
-	// Persist { port, token } for desktop UI to display (plan 06 reads this)
+	// Persist connection metadata for the desktop status UI.
 	mkdirSync(dirname(META_PATH), { recursive: true });
 	writeFileSync(META_PATH, JSON.stringify({ port, token }, null, 2), {
 		mode: 0o600,
@@ -630,12 +630,11 @@ export async function register(ctx) {
 		{ approvalTier: "always" },
 	);
 
-	// WS handler for desktop → gateway status polling. Plan 06 will poll this.
-	// Note: plugin WS handlers are namespaced as plugin.{pluginId}.{type}, so this
-	// registers as "plugin.chrome.status". Desktop (Plan 06) should send
-	// type "plugin.chrome.status" to receive { connected, lastHandshakeAt, port }.
-	// The logical name is chrome.status (W3: desktop Installed & connected badge).
-	// Echoes requestId back for desktop RPC correlation (Plan 06 gateway-rpc pattern).
+	// Handle desktop-to-gateway status requests over the plugin WebSocket.
+	// The sandbox namespaces this handler as "plugin.chrome.status". Clients send
+	// type "plugin.chrome.status" and receive { connected, lastHandshakeAt, port }.
+	// The public logical name is chrome.status, used by the desktop connection badge.
+	// Echo requestId so desktop RPC callers can correlate the response.
 	const statusHandler = async (msg) => {
 		const m = msg && typeof msg === "object" ? msg : {};
 		return {
